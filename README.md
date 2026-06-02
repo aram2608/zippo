@@ -1,2 +1,2 @@
-# zip
+# zippo
 Yet another text editor while I procrastinate
