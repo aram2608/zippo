@@ -5,6 +5,8 @@ const Out = @import("../util/printer.zig").Out;
 fd: std.posix.fd_t,
 screen_rows: u16 = 0,
 screen_cols: u16 = 0,
+cy: i16 = 0,
+cx: i16 = 0,
 writer: *Out,
 
 const VERSION = "0.1.0";
@@ -23,14 +25,36 @@ fn controlKey(comptime c: u8) u8 {
     return c & 0x1f;
 }
 
-pub fn readKey(self: *const Editor) !u8 {
+fn readByte(self: *const Editor) ?u8 {
+    var b: [1]u8 = undefined;
+    const n = std.posix.read(self.fd, &b) catch return null;
+    return if (n == 1) b[0] else null;
+}
+
+pub fn readKey(self: *const Editor) !Key {
     var in: [1]u8 = undefined;
     while (true) {
-        const n = try std.posix.read(self.fd, &in);
-        if (n == 0) continue;
-
-        return in[0];
+        const n = std.posix.read(self.fd, &in) catch |err| switch (err) {
+            error.WouldBlock => continue,
+            else => return err,
+        };
+        if (n == 1) break;
     }
+
+    if (in[0] != '\x1b') return .{ .char = in[0] };
+
+    const b0 = self.readByte() orelse return .{ .char = '\x1b' };
+    const b1 = self.readByte() orelse return .{ .char = '\x1b' };
+
+    if (b0 == '[') return switch (b1) {
+        'A' => .arrow_up,
+        'B' => .arrow_down,
+        'C' => .arrow_right,
+        'D' => .arrow_left,
+        else => .{ .char = '\x1b' },
+    };
+
+    return .{ .char = '\x1b' };
 }
 
 fn centerLine(self: *const Editor, len: u16) u16 {
@@ -74,7 +98,8 @@ pub fn refresh(self: *const Editor) !void {
 
     try self.drawRows();
 
-    try self.writer.print("\x1b[H", .{});
+    try self.writer.print("\x1b[{d};{d}H", .{ self.cy + 1, self.cx + 1 });
+
     // Redraw the cursor, Set Mode
     try self.writer.print("\x1b[?25h", .{});
 
@@ -128,3 +153,21 @@ pub fn getWindowSize(self: *Editor) !void {
         self.screen_rows = ws.row;
     }
 }
+
+pub fn moveCursor(self: *Editor, key: u8) void {
+    switch (key) {
+        'h' => self.cx -= 1,
+        'l' => self.cx += 1,
+        'k' => self.cy -= 1,
+        'j' => self.cy += 1,
+        else => {},
+    }
+}
+
+const Key = union(enum) {
+    char: u8,
+    arrow_up,
+    arrow_down,
+    arrow_left,
+    arrow_right,
+};

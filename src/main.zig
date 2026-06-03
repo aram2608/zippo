@@ -33,13 +33,15 @@ pub fn main(init: std.process.Init) !void {
         const c = try e.readKey();
 
         switch (c) {
-            controlKey('q') => {
-                try out.print("\x1b[2J", .{});
-                try out.print("\x1b[H", .{});
-                try out.flush();
-                break;
+            .char => |ch| switch (ch) {
+                controlKey('q') => break,
+                'h', 'j', 'k', 'l' => e.moveCursor(ch),
+                else => {},
             },
-            else => {},
+            .arrow_left => e.moveCursor('h'),
+            .arrow_down => e.moveCursor('j'),
+            .arrow_up => e.moveCursor('k'),
+            .arrow_right => e.moveCursor('l'),
         }
     }
 }
