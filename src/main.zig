@@ -9,18 +9,6 @@ fn controlKey(comptime c: u8) u8 {
     return c & 0x1f;
 }
 
-fn getWindowSize(rows: *u16, cols: *u16) !void {
-    var ws: std.posix.winsize = undefined;
-    const rc = std.posix.system.ioctl(
-        std.posix.STDOUT_FILENO,
-        std.posix.T.IOCGWINSZ,
-        @intFromPtr(&ws),
-    );
-    if (std.posix.errno(rc) != .SUCCESS or ws.col == 0) return error.GetWindowSizeFailed;
-    cols.* = ws.col;
-    rows.* = ws.row;
-}
-
 pub fn main(init: std.process.Init) !void {
     // This is appropriate for anything that lives as long as the process.
     // const arena: std.mem.Allocator = init.arena.allocator();
@@ -35,17 +23,14 @@ pub fn main(init: std.process.Init) !void {
     const raw = try zippo.RawMode.init(fd);
     defer raw.deinit();
 
-    var screen_rows: u16 = undefined;
-    var screen_cols: u16 = undefined;
+    var e = zippo.Editor.init(raw.fd, &out);
 
-    try getWindowSize(&screen_rows, &screen_cols);
-
-    const e = zippo.Editor.init(screen_rows, screen_cols);
+    try e.getWindowSize();
 
     while (true) {
-        try e.refresh(&out);
+        try e.refresh();
 
-        const c = try e.readKey(fd);
+        const c = try e.readKey();
 
         switch (c) {
             controlKey('q') => {
