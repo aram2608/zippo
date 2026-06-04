@@ -135,6 +135,8 @@ fn appendToChangeBuffer(self: *PieceTree, text: []const u8) !Piece {
         }
     }
 
+    self.last_change_pos = start + @as(u32, @intCast(text.len));
+
     // Each append returns a new Piece with indexes into the buffer
     // Memory allocations in Zig can change the location of the data
     // This prevents saving slices of data since they can end up pointing at junk
@@ -146,35 +148,39 @@ fn appendToChangeBuffer(self: *PieceTree, text: []const u8) !Piece {
     };
 }
 
+fn classify(self: *const PieceTree, p: Position, o: u32) InsertInst {
+    const piece = p.node.piece;
+    if (piece.idx == .change and piece.start + piece.len == self.last_change_pos and p.node_start_offset + piece.len == o) return .hot_path;
+    if (p.node_start_offset == o) return .node_boundary;
+    if (p.node_start_offset + piece.len > o) return .mid_node;
+    return .end_node;
+}
+
 pub fn insert(self: *PieceTree, offset: u32, text: []const u8) !void {
-    if (self.root != self.sentinel) {
-        const pos = self.nodeAt(offset).?;
-        const piece = pos.node.piece;
-        const idx = piece.idx;
+    // Graft brand new nodes
+    if (self.root == self.sentinel) {
+        const np = try self.appendToChangeBuffer(text);
+        _ = try self.insertLeft(null, np);
+        return;
+    }
+
+    const pos = self.nodeAt(offset).?;
+    const inst: InsertInst = self.classify(pos, offset);
+    switch (inst) {
         // Hot-Path for typing, we simply bump the node length given the length
         // of the input text
         // The char is input from the last touched piece so we do not have to
         // make a new one
-        if (idx == .change and piece.start + piece.len == self.last_change_pos and pos.node_start_offset + piece.len == offset) {
+        .hot_path => {
             const np = try self.appendToChangeBuffer(text);
+            pos.node.piece.len += np.len;
+            pos.node.piece.line_feeds += np.line_feeds;
             self.updateMetadata(pos.node, np.len, np.line_feeds);
-            @panic("write a test case for this insert");
-        }
-
-        // Node boundary insert
-        if (pos.node_start_offset == offset) {
-            @panic("insertToNodeLeft not impl");
-            // Mid node split, you have one piece [A | B] and want [A | NEW | B].
-        } else if (pos.node_start_offset + piece.len > offset) {
-            @panic("implement mid node insertions");
-            // Add to the end of the node
-        } else {
-            @panic("insertToNodeRight not impl");
-        }
-        // Graft brand new nodes
-    } else {
-        const np = try self.appendToChangeBuffer(text);
-        _ = try self.insertLeft(null, np);
+        },
+        .node_boundary => @panic("insertToNodeLeft not impl"),
+        // Mid node split, you have one piece [A | B] and want [A | NEW | B].
+        .mid_node => @panic("mid-node split not impl"),
+        .end_node => @panic("insertToNodeRight not impl"),
     }
 }
 
@@ -202,7 +208,6 @@ fn insertLeft(self: *PieceTree, node: ?*Node, p: Piece) !*Node {
         z.parent = pn;
     }
 
-    // TODO: Fix on insert
     self.fixInsert(z);
     self.updateMetadata(z, p.len, p.line_feeds);
 
@@ -335,6 +340,13 @@ pub const Node = struct {
 
 const Color = enum(u1) { black = 0, red = 1 };
 
+const InsertInst = enum {
+    hot_path,
+    mid_node,
+    node_boundary,
+    end_node,
+};
+
 const BufferIndex = enum(u32) { change = 0, _ };
 pub const DocumentOffset = enum(u32) { zero = 0, _ };
 pub const BufferOffset = enum(u32) { _ };
@@ -360,8 +372,20 @@ const Buffer = struct {
     }
 };
 
-test "load tree" {
+test "insert into empty tree" {
     var p = try PieceTree.init(std.testing.allocator);
     defer p.deinit();
-    try p.insert(0, "Hello, world\n");
+    try p.insert(0, "hello");
+    try std.testing.expectEqual(@as(u32, 5), p.root.piece.len);
+    try std.testing.expect(p.root.color == .black);
+    p.validate(p.root);
+}
+
+test "hot-path append extends piece" {
+    var p = try PieceTree.init(std.testing.allocator);
+    defer p.deinit();
+    try p.insert(0, "hel");
+    try p.insert(3, "lo"); // should hit fast-append
+    try std.testing.expectEqual(@as(u32, 5), p.root.piece.len);
+    p.validate(p.root);
 }
