@@ -1,5 +1,6 @@
 const std = @import("std");
 pub const Editor = @This();
+const PieceTree = @import("../buffer/PieceTree.zig");
 const Out = @import("../util/printer.zig").Out;
 
 // CLRF, Carriage Return Line Feed \r\n
@@ -7,17 +8,31 @@ const Out = @import("../util/printer.zig").Out;
 fd: std.posix.fd_t,
 screen_rows: u16 = 0,
 screen_cols: u16 = 0,
+row_offset: u32 = 0,
+pt: PieceTree,
 cy: u16 = 0,
 cx: u16 = 0,
 writer: *Out,
+scratch: std.heap.ArenaAllocator,
 
 const VERSION = "0.1.0";
 
-pub fn init(fd: std.posix.fd_t, writer: *Out) Editor {
+pub fn init(
+    fd: std.posix.fd_t,
+    writer: *Out,
+    allocator: std.mem.Allocator,
+) !Editor {
     return .{
         .fd = fd,
+        .pt = try PieceTree.init(allocator),
         .writer = writer,
+        .scratch = .init(allocator),
     };
+}
+
+pub fn deinit(self: *Editor) void {
+    self.pt.deinit();
+    self.scratch.deinit();
 }
 
 // Bitwise & the char with 00011111
@@ -84,12 +99,40 @@ fn centerLine(self: *const Editor, len: u16) u16 {
     return (self.screen_cols - len) / 2;
 }
 
-fn drawRows(self: *const Editor) !void {
-    var y: usize = 0;
+pub fn insertChar(self: *Editor, ch: u8) !void {
+    // Clamp on EOF
+    const line_off = self.pt.offsetOfLine(self.cy + 1) orelse {
+        return;
+    };
+    const off = line_off + self.cx;
+    try self.pt.insert(off, &[_]u8{ch});
+    if (ch == '\n') {
+        self.cy += 1;
+        self.cx = 0;
+    } else {
+        self.cx += 1;
+    }
+}
+
+fn drawRows(self: *Editor) !void {
+    const total = self.pt.totalLines();
+    var y: u32 = 0;
     while (y < self.screen_rows) : (y += 1) {
-        if (y == self.screen_rows / 3) {
+        const row = y + self.row_offset;
+        if (row < total) {
+            const line = try self.pt.getLineContent(
+                self.scratch.allocator(),
+                (row + 1),
+            );
+            const len = @min(line.len, self.screen_cols);
+            try self.writer.print("{s}", .{line[0..len]});
+        } else if (total == 0 and y == self.screen_rows / 3) {
             var buf: [80]u8 = undefined;
-            const msg = try std.fmt.bufPrint(&buf, "zippo -- version {s}", .{VERSION});
+            const msg = try std.fmt.bufPrint(
+                &buf,
+                "zippo -- version {s}",
+                .{VERSION},
+            );
             const len = @min(msg.len, self.screen_cols);
             var pad = self.centerLine(len);
 
@@ -112,8 +155,10 @@ fn drawRows(self: *const Editor) !void {
     try self.writer.flush();
 }
 
-pub fn refresh(self: *const Editor) !void {
+pub fn refresh(self: *Editor) !void {
     // \x1b is 27 in decimal
+
+    _ = self.scratch.reset(.retain_capacity);
 
     // Hide cursor during refresh, Reset Mode
     try self.writer.print("\x1b[?25l", .{});

@@ -11,7 +11,12 @@ fn controlKey(comptime c: u8) u8 {
 
 pub fn main(init: std.process.Init) !void {
     // This is appropriate for anything that lives as long as the process.
-    // const arena: std.mem.Allocator = init.arena.allocator();
+    const arena: std.mem.Allocator = init.arena.allocator();
+
+    const args = try init.minimal.args.toSlice(arena);
+    for (args) |arg| {
+        std.log.info("arg: {s}", .{arg});
+    }
 
     // In order to do I/O operations need an `Io` instance.
     const io = init.io;
@@ -28,7 +33,11 @@ pub fn main(init: std.process.Init) !void {
     const raw = try zippo.RawMode.init(fd);
     defer raw.deinit();
 
-    var e = zippo.Editor.init(raw.fd, &out);
+    // Long-lived allocator for the piece tree; supports real free as edits delete nodes.
+    const gpa = std.heap.smp_allocator;
+
+    var e = try zippo.Editor.init(raw.fd, &out, gpa);
+    defer e.deinit();
 
     try e.getWindowSize();
 
@@ -45,11 +54,8 @@ pub fn main(init: std.process.Init) !void {
                     try out.flush();
                     break;
                 },
-                'h' => e.moveCursor(.arrow_left),
-                'j' => e.moveCursor(.arrow_down),
-                'k' => e.moveCursor(.arrow_up),
-                'l' => e.moveCursor(.arrow_right),
-                else => {},
+                '\r' => try e.insertChar('\n'),
+                else => try e.insertChar(ch),
             },
             .arrow_left => e.moveCursor(c),
             .arrow_down => e.moveCursor(c),
