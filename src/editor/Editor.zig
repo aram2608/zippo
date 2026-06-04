@@ -2,11 +2,13 @@ const std = @import("std");
 pub const Editor = @This();
 const Out = @import("../util/printer.zig").Out;
 
+// CLRF, Carriage Return Line Feed \r\n
+
 fd: std.posix.fd_t,
 screen_rows: u16 = 0,
 screen_cols: u16 = 0,
-cy: i16 = 0,
-cx: i16 = 0,
+cy: u16 = 0,
+cx: u16 = 0,
 writer: *Out,
 
 const VERSION = "0.1.0";
@@ -46,11 +48,31 @@ pub fn readKey(self: *const Editor) !Key {
     const b0 = self.readByte() orelse return .{ .char = '\x1b' };
     const b1 = self.readByte() orelse return .{ .char = '\x1b' };
 
-    if (b0 == '[') return switch (b1) {
-        'A' => .arrow_up,
-        'B' => .arrow_down,
-        'C' => .arrow_right,
-        'D' => .arrow_left,
+    if (b0 == '[') {
+        if (b1 >= '0' and b1 <= '9') {
+            const b2 = self.readByte() orelse return .{ .char = '\x1b' };
+            if (b2 == '~') return switch (b1) {
+                '1' => .home,
+                '3' => .delete,
+                '4' => .end,
+                '5' => .page_up,
+                '6' => .page_down,
+                '7' => .home,
+                '8' => .end,
+                else => .{ .char = '\x1b' },
+            };
+        } else return switch (b1) {
+            'A' => .arrow_up,
+            'B' => .arrow_down,
+            'C' => .arrow_right,
+            'D' => .arrow_left,
+            'H' => .home,
+            'F' => .end,
+            else => .{ .char = '\x1b' },
+        };
+    } else if (b0 == 'O') return switch (b1) {
+        'H' => .home,
+        'F' => .end,
         else => .{ .char = '\x1b' },
     };
 
@@ -58,6 +80,7 @@ pub fn readKey(self: *const Editor) !Key {
 }
 
 fn centerLine(self: *const Editor, len: u16) u16 {
+    if (len >= self.screen_cols) return 0;
     return (self.screen_cols - len) / 2;
 }
 
@@ -83,7 +106,8 @@ fn drawRows(self: *const Editor) !void {
 
         // Clear each line as we draw it, Erase in Line
         try self.writer.print("\x1b[K", .{});
-        if (y < self.screen_rows - 1) try self.writer.print("\r\n", .{});
+        if (self.screen_rows > 0 and y + 1 < self.screen_rows)
+            try self.writer.print("\r\n", .{});
     }
     try self.writer.flush();
 }
@@ -140,7 +164,7 @@ pub fn getWindowSize(self: *Editor) !void {
         std.posix.T.IOCGWINSZ,
         @intFromPtr(&ws),
     );
-    if (std.posix.errno(rc) != .SUCCESS or ws.col == 0) {
+    if (std.posix.errno(rc) != .SUCCESS or ws.col == 0 or ws.row == 0) {
         // C command is the Cursor forward
         // B command is Cursor down
         // There is no easy way to get the cursor position so we use this hack
@@ -154,12 +178,20 @@ pub fn getWindowSize(self: *Editor) !void {
     }
 }
 
-pub fn moveCursor(self: *Editor, key: u8) void {
+pub fn moveCursor(self: *Editor, key: Key) void {
     switch (key) {
-        'h' => self.cx -= 1,
-        'l' => self.cx += 1,
-        'k' => self.cy -= 1,
-        'j' => self.cy += 1,
+        .arrow_left => {
+            if (self.cx != 0) self.cx -= 1;
+        },
+        .arrow_right => {
+            if (self.screen_cols > 0 and self.cx + 1 < self.screen_cols) self.cx += 1;
+        },
+        .arrow_up => {
+            if (self.cy != 0) self.cy -= 1;
+        },
+        .arrow_down => {
+            if (self.screen_rows > 0 and self.cy + 1 < self.screen_rows) self.cy += 1;
+        },
         else => {},
     }
 }
@@ -170,4 +202,9 @@ const Key = union(enum) {
     arrow_down,
     arrow_left,
     arrow_right,
+    page_up,
+    page_down,
+    home,
+    end,
+    delete,
 };
