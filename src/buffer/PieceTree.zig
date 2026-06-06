@@ -229,6 +229,266 @@ pub fn insert(self: *PieceTree, offset: u32, text: []const u8) !void {
     }
 }
 
+/// Trim the first `remainder` bytes off the piece's left side.
+fn deleteNodeHead(self: *PieceTree, node: *Node, remainder: u32) void {
+    const old = node.piece;
+    const dropped_lf = countLF(self.bufferBytes(old.idx), old.start, old.start + remainder);
+
+    node.piece.start = old.start + remainder;
+    node.piece.len = old.len - remainder;
+    node.piece.line_feeds = old.line_feeds - dropped_lf;
+    self.updateMetadata(node, -@as(i64, remainder), -@as(i64, dropped_lf));
+}
+
+/// Keep only the first `remainder` bytes of the piece.
+fn deleteNodeTail(self: *PieceTree, node: *Node, remainder: u32) void {
+    const old = node.piece;
+    const kept_lf = countLF(self.bufferBytes(old.idx), old.start, old.start + remainder);
+    const dropped_len = old.len - remainder;
+
+    node.piece.len = remainder;
+    node.piece.line_feeds = kept_lf;
+    self.updateMetadata(node, -@as(i64, dropped_len), -@as(i64, old.line_feeds - kept_lf));
+}
+
+/// Split `node` into [0..start) and [end..len), drop the middle.
+fn shrinkNode(self: *PieceTree, node: *Node, start: u32, end: u32) !void {
+    const old = node.piece;
+    const right_start = old.start + end;
+    const right_len = old.len - end;
+    const right_lf = countLF(self.bufferBytes(old.idx), right_start, right_start + right_len);
+
+    self.deleteNodeTail(node, start);
+    _ = try self.insertRight(node, .{
+        .idx = old.idx,
+        .start = right_start,
+        .len = right_len,
+        .line_feeds = right_lf,
+    });
+}
+
+fn recomputeMetaData(self: *PieceTree, n: *Node) void {
+    var x = n;
+    var delta: u32 = 0;
+    var lf_delta: u32 = 0;
+
+    if (x == self.root) return;
+
+    while (x != self.root and x == x.parent.right) {
+        x = x.parent;
+    }
+
+    if (x == self.root) return;
+
+    x = x.parent;
+
+    const new_sl = self.calcSize(x.left);
+    const new_lfl = self.calcLF(x.left);
+    delta = new_sl - x.size_left;
+    lf_delta = new_lfl - x.lf_left;
+
+    x.size_left = new_sl;
+    x.lf_left = new_lfl;
+
+    while (x != self.root) {
+        if (x.parent.left == x) {
+            x.parent.size_left += delta;
+            x.parent.lf_left += lf_delta;
+        }
+
+        x = x.parent;
+    }
+}
+
+fn calcLF(self: *const PieceTree, n: *Node) u32 {
+    if (n == self.sentinel) return 0;
+    return n.lf_left + n.piece.line_feeds + self.calcLF(n.right);
+}
+
+fn calcSize(self: *const PieceTree, n: *Node) u32 {
+    if (n == self.sentinel) return 0;
+    return n.size_left + n.piece.len + self.calcSize(n.right);
+}
+
+pub fn delete(self: *PieceTree, offset: u32, count: u32) !void {
+    if (count == 0 or self.root == self.sentinel) return;
+
+    const start_pos = self.nodeAt(offset).?;
+    const end_pos = self.nodeAt(offset + count).?;
+
+    const start_node = start_pos.node;
+    const end_node = end_pos.node;
+
+    if (start_node == end_node) {
+        if (start_pos.node_start_offset == offset) {
+            if (count == start_node.piece.len) {
+                self.deleteNode(start_node);
+                return;
+            }
+            self.deleteNodeHead(start_node, end_pos.remainder);
+            return;
+        }
+
+        if (start_pos.node_start_offset + start_node.piece.len == offset + count) {
+            self.deleteNodeTail(start_node, start_pos.remainder);
+            return;
+        }
+
+        try self.shrinkNode(start_node, start_pos.remainder, end_pos.remainder);
+        return;
+    }
+
+    self.deleteNodeTail(start_node, start_pos.remainder);
+    var n = self.successor(start_node);
+    if (start_node.piece.len == 0) self.deleteNode(start_node);
+
+    self.deleteNodeHead(end_node, end_pos.remainder);
+    if (end_node.piece.len == 0) self.deleteNode(end_node);
+
+    while (n != self.sentinel and n != end_node) {
+        const after = self.successor(n);
+        self.deleteNode(n);
+        n = after;
+    }
+}
+
+fn deleteNode(self: *PieceTree, z: *Node) void {
+    var x: *Node = undefined;
+    var y: *Node = undefined;
+
+    if (z.left == self.sentinel) {
+        y = z;
+        x = y.right;
+    } else if (z.right == self.sentinel) {
+        y = z;
+        x = y.left;
+    } else {
+        y = self.leftmost(z.right);
+        x = y.right;
+    }
+
+    if (y == self.root) {
+        self.root = x;
+        x.color = .black;
+        self.detach(z);
+        self.root.parent = self.sentinel;
+        return;
+    }
+
+    const y_was_red = y.color == .red;
+
+    if (y == y.parent.left) {
+        y.parent.left = x;
+    } else {
+        y.parent.right = x;
+    }
+
+    if (y == z) {
+        x.parent = y.parent;
+        self.recomputeMetaData(x);
+    } else {
+        if (y.parent == z) {
+            x.parent = y;
+        } else {
+            x.parent = y.parent;
+        }
+
+        y.left = z.left;
+        y.right = z.right;
+        y.parent = z.parent;
+        y.color = z.color;
+
+        if (z == self.root) {
+            self.root = y;
+        } else {
+            if (z == z.parent.left) {
+                z.parent.left = y;
+            } else {
+                z.parent.right = y;
+            }
+        }
+
+        if (y.left != self.sentinel) {
+            y.left.parent = y;
+        }
+
+        if (y.right != self.sentinel) {
+            y.right.parent = y;
+        }
+        y.size_left = x.size_left;
+        y.lf_left = x.lf_left;
+        self.recomputeMetaData(x);
+    }
+
+    self.detach(z);
+
+    self.recomputeMetaData(x.parent);
+
+    if (!y_was_red) self.fixDelete(x);
+}
+
+fn fixDelete(self: *PieceTree, x_param: *Node) void {
+    var x = x_param;
+    var w = x;
+    while (x != self.root and x.color == .black) {
+        if (x == x.parent.left) {
+            w = x.parent.right;
+
+            if (w.color == .red) {
+                w.color = .black;
+                x.parent.color = .red;
+                self.leftRotate(x.parent);
+                w = x.parent.left;
+            }
+
+            if (w.left.color == .black and w.right.color == .black) {
+                w.color = .red;
+                x = x.parent;
+            } else {
+                if (w.right.color == .black) {
+                    w.left.color = .black;
+                    w.color = .red;
+                    self.rightRotate(x.parent);
+                    x = self.root;
+                }
+
+                w.color = x.parent.color;
+                x.parent.color = .black;
+                x.right.color = .black;
+                self.leftRotate(x.parent);
+                x = self.root;
+            }
+        } else {
+            w = x.parent.left;
+
+            if (w.color == .red) {
+                w.color = .black;
+                x.parent.color = .red;
+                self.rightRotate(x.parent);
+                w = x.parent.left;
+            }
+
+            if (w.left.color == .black and w.right.color == .black) {
+                w.color = .red;
+                x = x.parent;
+            } else {
+                if (w.left.color == .black) {
+                    w.right.color = .black;
+                    w.color = .red;
+                    self.leftRotate(w);
+                    w = x.parent.left;
+                }
+
+                w.color = x.parent.color;
+                x.parent.color = .black;
+                w.left.color = .black;
+                self.rightRotate(x.parent);
+                x = self.root;
+            }
+        }
+    }
+}
+
 fn insertLeft(self: *PieceTree, node: ?*Node, p: Piece) !*Node {
     var z = try self.allocator.create(Node);
     z.* = .{
@@ -334,6 +594,21 @@ fn fixInsert(self: *PieceTree, n: *Node) void {
     }
 
     self.root.color = .black;
+}
+
+// I should probably just destroy the node since i have no garbage collector like JS
+fn detach(self: *PieceTree, n: *Node) void {
+    n.left = self.sentinel;
+    n.right = self.sentinel;
+    n.parent = self.sentinel;
+    self.allocator.destroy(n);
+}
+
+fn successor(self: *const PieceTree, n: *Node) *Node {
+    if (n.right != self.sentinel) return self.leftmost(n.right);
+    var x = n;
+    while (x.parent != self.sentinel and x == x.parent.right) x = x.parent;
+    return x.parent;
 }
 
 fn rightmost(self: *const PieceTree, start: *Node) *Node {
@@ -466,13 +741,6 @@ fn offsetAfterNthLF(self: *PieceTree, p: Piece, k: u32) u32 {
     const first = std.sort.upperBound(u32, ls, p.start, cmpU32);
     const abs = ls[first + k - 1];
     return abs - p.start;
-}
-
-fn successor(self: *const PieceTree, n: *Node) *Node {
-    if (n.right != self.sentinel) return self.leftmost(n.right);
-    var x = n;
-    while (x.parent != self.sentinel and x == x.parent.right) x = x.parent;
-    return x.parent;
 }
 
 /// Calculates the number of lines from the total line feeds (LR)
@@ -610,4 +878,29 @@ test "totalLines and offsetOfLine" {
     try std.testing.expectEqual(@as(?u32, 0), p.offsetOfLine(1));
     try std.testing.expectEqual(@as(?u32, 3), p.offsetOfLine(2));
     try std.testing.expectEqual(@as(?u32, 6), p.offsetOfLine(3));
+}
+
+test "delete shrinks the middle of a single piece" {
+    var p = try PieceTree.init(std.testing.allocator);
+    defer p.deinit();
+    try p.insert(0, "helloXXXworld");
+    try p.delete(5, 3); // drop "XXX" → "helloworld"
+    try std.testing.expectEqual(@as(u32, 10), p.subtreeBytes(p.root));
+    const line = try p.getLineContent(std.testing.allocator, 1);
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualSlices(u8, "helloworld", line);
+    p.validate(p.root);
+}
+
+test "delete spanning two pieces trims tail of first and head of second" {
+    var p = try PieceTree.init(std.testing.allocator);
+    defer p.deinit();
+    try p.insert(0, "abcXX"); // right piece
+    try p.insert(0, "YYdef"); // becomes left piece → doc is "YYdefabcXX"
+    try p.delete(3, 4); // drop "efab" → "YYdcXX"
+    try std.testing.expectEqual(@as(u32, 6), p.subtreeBytes(p.root));
+    const line = try p.getLineContent(std.testing.allocator, 1);
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualSlices(u8, "YYdcXX", line);
+    p.validate(p.root);
 }
