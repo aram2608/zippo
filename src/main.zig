@@ -61,15 +61,24 @@ pub fn main(init: std.process.Init) !void {
                 '\r' => try e.insertChar('\n'),
                 else => try e.insertChar(ch),
             },
-            .arrow_left => e.moveCursor(c),
-            .arrow_down => e.moveCursor(c),
-            .arrow_up => e.moveCursor(c),
-            .arrow_right => e.moveCursor(c),
-            .page_down, .page_up => {
-                var times = e.screen_rows;
-                while (times > 0) : (times -= 1) {
-                    e.moveCursor(if (c == .page_up) .arrow_up else .arrow_down);
-                }
+            .arrow_left,
+            .arrow_down,
+            .arrow_up,
+            .arrow_right,
+            => e.moveCursor(c),
+            .page_up => {
+                e.cy = e.row_offset; // top of view port
+                var n = e.screen_rows;
+                while (n > 0 and e.cy > 0) : (n -= 1) e.cy -= 1;
+            },
+            .page_down => blk: {
+                const total = e.pt.totalLines();
+                // Guard against underflows
+                if (total == 0 or e.screen_rows == 0) break :blk;
+                e.cy = e.row_offset + e.screen_rows - 1; // bottom of viewport
+                if (e.cy >= total) e.cy = total - 1;
+                var n = e.screen_rows;
+                while (n > 0 and e.cy + 1 < total) : (n -= 1) e.cy += 1;
             },
             .home => e.cx = 0,
             .end => e.cx = e.screen_cols - 1,

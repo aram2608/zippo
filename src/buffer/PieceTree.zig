@@ -78,12 +78,12 @@ pub fn loadFile(self: *PieceTree, io: std.Io, path: []const u8) !void {
         const idx: BufferIndex = @enumFromInt(self.buffers.items.len);
         try self.buffers.append(self.allocator, buf);
 
-        _ = try self.insertLeft(null, .{
+        _ = try self.insertNode(null, .{
             .idx = idx,
             .start = 0,
             .len = @intCast(buf.bytes.items.len),
             .line_feeds = lf,
-        });
+        }, .left);
     } else |err| switch (err) {
         error.FileNotFound, error.AccessDenied => {
             std.debug.print("unable to open file: {}\n", .{err});
@@ -99,24 +99,15 @@ fn freeSubtree(self: *PieceTree, node: *Node) void {
     self.allocator.destroy(node);
 }
 
-/// Resolve a piece's bytes on demand (re-indexing into the live buffer).
-fn pieceBytes(self: *PieceTree, p: Piece) []const u8 {
-    const b = self.buffers.items[@intFromEnum(p.buffer)].bytes.items;
-    return b[p.start .. p.start + p.len];
-}
-
 /// Resolve the bytes in a buffer given a specific index
 fn bufferBytes(self: *const PieceTree, idx: BufferIndex) []const u8 {
     return self.buffers.items[@intFromEnum(idx)].bytes.items;
 }
 
 /// A simple helper to calculate the line feeds in a slice of bytes
+/// Wraps mem.count since its apparently bonkers optimized
 fn countLF(bytes: []const u8, start: u32, end: u32) u32 {
-    var n: u32 = 0;
-    for (bytes[start..end]) |c| {
-        if (c == '\n') n += 1;
-    }
-    return n;
+    return @intCast(std.mem.count(u8, bytes[start..end], "\n"));
 }
 
 fn leftRotate(self: *PieceTree, x: *Node) void {
@@ -192,15 +183,15 @@ fn appendToChangeBuffer(self: *PieceTree, text: []const u8) !Piece {
 
     try buf.bytes.appendSlice(self.allocator, text);
     var lf: u32 = 0;
-    for (text, 0..) |c, i| {
-        if (c == '\n') {
-            lf += 1;
-            // Calculate 1 value past the `\n` as it is a new line
-            try buf.line_starts.append(self.allocator, start + @as(
-                u32,
-                @intCast(i),
-            ) + 1);
-        }
+    var index: usize = 0;
+    while (std.mem.findScalarPos(u8, text, index, '\n')) |next_lf| {
+        lf += 1;
+        index = next_lf + 1;
+
+        try buf.line_starts.append(
+            self.allocator,
+            @intCast(start + index),
+        );
     }
 
     self.last_change_pos = start + @as(u32, @intCast(text.len));
@@ -216,6 +207,8 @@ fn appendToChangeBuffer(self: *PieceTree, text: []const u8) !Piece {
     };
 }
 
+/// A simple helper to classify insertion operations to make the insert function
+/// a but more readable
 fn classify(self: *const PieceTree, p: Position, o: u32) InsertInst {
     const piece = p.node.piece;
     if (piece.idx == .change and piece.start + piece.len == self.last_change_pos and p.node_start_offset + piece.len == o) return .hot_path;
@@ -228,7 +221,7 @@ pub fn insert(self: *PieceTree, offset: u32, text: []const u8) !void {
     // Graft brand new nodes
     if (self.root == self.sentinel) {
         const np = try self.appendToChangeBuffer(text);
-        _ = try self.insertLeft(null, np);
+        _ = try self.insertNode(null, np, .left);
         return;
     }
 
@@ -247,7 +240,7 @@ pub fn insert(self: *PieceTree, offset: u32, text: []const u8) !void {
             self.updateMetadata(pos.node, np.len, np.line_feeds);
         },
         .node_boundary => {
-            _ = try self.insertLeft(pos.node, np);
+            _ = try self.insertNode(pos.node, np, .left);
         },
         // Mid node split, you have one piece [A | B] and want [A | NEW | B].
         .mid_node => {
@@ -274,11 +267,11 @@ pub fn insert(self: *PieceTree, offset: u32, text: []const u8) !void {
             self.updateMetadata(pos.node, len_delta, lf_delta);
 
             // The new piece is grafted to B as successive right-insertions
-            const mid = try self.insertRight(pos.node, np);
-            _ = try self.insertRight(mid, right_piece);
+            const mid = try self.insertNode(pos.node, np, .right);
+            _ = try self.insertNode(mid, right_piece, .right);
         },
         .end_node => {
-            _ = try self.insertRight(pos.node, np);
+            _ = try self.insertNode(pos.node, np, .right);
         },
     }
 }
@@ -286,7 +279,11 @@ pub fn insert(self: *PieceTree, offset: u32, text: []const u8) !void {
 /// Trim the first `remainder` bytes off the piece's left side.
 fn deleteNodeHead(self: *PieceTree, node: *Node, remainder: u32) void {
     const old = node.piece;
-    const dropped_lf = countLF(self.bufferBytes(old.idx), old.start, old.start + remainder);
+    const dropped_lf = countLF(
+        self.bufferBytes(old.idx),
+        old.start,
+        (old.start + remainder),
+    );
 
     node.piece.start = old.start + remainder;
     node.piece.len = old.len - remainder;
@@ -297,12 +294,20 @@ fn deleteNodeHead(self: *PieceTree, node: *Node, remainder: u32) void {
 /// Keep only the first `remainder` bytes of the piece.
 fn deleteNodeTail(self: *PieceTree, node: *Node, remainder: u32) void {
     const old = node.piece;
-    const kept_lf = countLF(self.bufferBytes(old.idx), old.start, old.start + remainder);
+    const kept_lf = countLF(
+        self.bufferBytes(old.idx),
+        old.start,
+        (old.start + remainder),
+    );
     const dropped_len = old.len - remainder;
 
     node.piece.len = remainder;
     node.piece.line_feeds = kept_lf;
-    self.updateMetadata(node, -@as(i64, dropped_len), -@as(i64, old.line_feeds - kept_lf));
+    self.updateMetadata(
+        node,
+        -@as(i64, dropped_len),
+        -@as(i64, old.line_feeds - kept_lf),
+    );
 }
 
 /// Split `node` into [0..start) and [end..len), drop the middle.
@@ -310,15 +315,19 @@ fn shrinkNode(self: *PieceTree, node: *Node, start: u32, end: u32) !void {
     const old = node.piece;
     const right_start = old.start + end;
     const right_len = old.len - end;
-    const right_lf = countLF(self.bufferBytes(old.idx), right_start, right_start + right_len);
+    const right_lf = countLF(
+        self.bufferBytes(old.idx),
+        right_start,
+        (right_start + right_len),
+    );
 
     self.deleteNodeTail(node, start);
-    _ = try self.insertRight(node, .{
+    _ = try self.insertNode(node, .{
         .idx = old.idx,
         .start = right_start,
         .len = right_len,
         .line_feeds = right_lf,
-    });
+    }, .right);
 }
 
 fn recomputeMetaData(self: *PieceTree, n: *Node) void {
@@ -354,11 +363,13 @@ fn recomputeMetaData(self: *PieceTree, n: *Node) void {
     }
 }
 
+/// Simple helper to calculate the number of line feeds (LR '\n') for a node
 fn calcLF(self: *const PieceTree, n: *Node) u32 {
     if (n == self.sentinel) return 0;
     return n.lf_left + n.piece.line_feeds + self.calcLF(n.right);
 }
 
+/// Simple helper to calculate the size of a node's bytes
 fn calcSize(self: *const PieceTree, n: *Node) u32 {
     if (n == self.sentinel) return 0;
     return n.size_left + n.piece.len + self.calcSize(n.right);
@@ -481,10 +492,11 @@ fn deleteNode(self: *PieceTree, z: *Node) void {
     if (!y_was_red) self.fixDelete(x);
 }
 
-fn fixDelete(self: *PieceTree, x_param: *Node) void {
-    var x = x_param;
-    var w = x;
-    while (x != self.root and x.color == .black) {
+fn fixDelete(self: *PieceTree, n: *Node) void {
+    while (n != self.root and n.color == .black) {
+        var x = n;
+        var w = x;
+
         if (x == x.parent.left) {
             w = x.parent.right;
 
@@ -543,7 +555,14 @@ fn fixDelete(self: *PieceTree, x_param: *Node) void {
     }
 }
 
-fn insertLeft(self: *PieceTree, node: ?*Node, p: Piece) !*Node {
+const NodeInsert = enum(u1) { left, right };
+
+fn insertNode(
+    self: *PieceTree,
+    node: ?*Node,
+    p: Piece,
+    i: NodeInsert,
+) !*Node {
     var z = try self.allocator.create(Node);
     z.* = .{
         .piece = p,
@@ -555,46 +574,33 @@ fn insertLeft(self: *PieceTree, node: ?*Node, p: Piece) !*Node {
         .lf_left = 0,
     };
 
-    if (self.root == self.sentinel) {
-        self.root = z;
-        z.color = .black;
-    } else if (node.?.left == self.sentinel) {
-        node.?.left = z;
-        z.parent = node.?;
-    } else {
-        var pn = self.rightmost(node.?.left);
-        pn.right = z;
-        z.parent = pn;
-    }
-
-    self.updateMetadata(z, p.len, p.line_feeds);
-    self.fixInsert(z);
-
-    return z;
-}
-
-fn insertRight(self: *PieceTree, node: ?*Node, p: Piece) !*Node {
-    var z = try self.allocator.create(Node);
-    z.* = .{
-        .piece = p,
-        .parent = self.sentinel,
-        .left = self.sentinel,
-        .right = self.sentinel,
-        .color = .red,
-        .size_left = 0,
-        .lf_left = 0,
-    };
-
-    if (self.root == self.sentinel) {
-        self.root = z;
-        z.color = .black;
-    } else if (node.?.right == self.sentinel) {
-        node.?.right = z;
-        z.parent = node.?;
-    } else {
-        var ln = self.leftmost(node.?.right);
-        ln.left = z;
-        z.parent = ln;
+    switch (i) {
+        .left => {
+            if (self.root == self.sentinel) {
+                self.root = z;
+                z.color = .black;
+            } else if (node.?.left == self.sentinel) {
+                node.?.left = z;
+                z.parent = node.?;
+            } else {
+                var pn = self.rightmost(node.?.left);
+                pn.right = z;
+                z.parent = pn;
+            }
+        },
+        .right => {
+            if (self.root == self.sentinel) {
+                self.root = z;
+                z.color = .black;
+            } else if (node.?.right == self.sentinel) {
+                node.?.right = z;
+                z.parent = node.?;
+            } else {
+                var ln = self.leftmost(node.?.right);
+                ln.left = z;
+                z.parent = ln;
+            }
+        },
     }
 
     self.updateMetadata(z, p.len, p.line_feeds);
@@ -603,8 +609,8 @@ fn insertRight(self: *PieceTree, node: ?*Node, p: Piece) !*Node {
 }
 
 fn fixInsert(self: *PieceTree, n: *Node) void {
-    var x = n;
-    while (x != self.root and x.parent.color == .red) {
+    while (n != self.root and n.parent.color == .red) {
+        var x = n;
         if (x.parent == x.parent.parent.left) {
             var y = x.parent.parent.right;
             switch (y.color) {
@@ -650,7 +656,6 @@ fn fixInsert(self: *PieceTree, n: *Node) void {
     self.root.color = .black;
 }
 
-// I should probably just destroy the node since i have no garbage collector like JS
 fn detach(self: *PieceTree, n: *Node) void {
     n.left = self.sentinel;
     n.right = self.sentinel;
@@ -726,6 +731,26 @@ fn lineStart(self: *PieceTree, line: u32) ?LineLoc {
         }
     }
     return null; // line past EOF
+}
+
+pub fn getLineLength(self: *PieceTree, line: u32) u32 {
+    const loc = self.lineStart(line) orelse return 0;
+    var node = loc.node;
+    var off = loc.offset_in_piece;
+
+    var len: u32 = 0;
+    while (node != self.sentinel) {
+        const p = node.piece;
+        const bytes = self.bufferBytes(p.idx)[p.start + off .. p.start + p.len];
+        if (std.mem.findScalar(u8, bytes, '\n')) |i| {
+            len += @intCast(i);
+            return len;
+        }
+        len += @intCast(bytes.len);
+        node = self.successor(node);
+        off = 0;
+    }
+    return len;
 }
 
 pub fn getLineContent(

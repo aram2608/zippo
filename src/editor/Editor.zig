@@ -10,8 +10,8 @@ screen_rows: u16 = 0,
 screen_cols: u16 = 0,
 row_offset: u32 = 0,
 pt: PieceTree,
-cy: u16 = 0,
-cx: u16 = 0,
+cy: u32 = 0,
+cx: u32 = 0,
 writer: *Out,
 scratch: std.heap.ArenaAllocator,
 
@@ -159,6 +159,15 @@ fn drawRows(self: *Editor) !void {
     try self.writer.flush();
 }
 
+fn scroll(self: *Editor) void {
+    if (self.cy < self.row_offset) {
+        self.row_offset = self.cy;
+    }
+    if (self.screen_rows > 0 and self.cy >= self.row_offset + self.screen_rows) {
+        self.row_offset = self.cy - self.screen_rows + 1;
+    }
+}
+
 pub fn refresh(self: *Editor) !void {
     // \x1b is 27 in decimal
 
@@ -169,9 +178,13 @@ pub fn refresh(self: *Editor) !void {
     // Set the cursor at the corner with the H command
     try self.writer.print("\x1b[H", .{});
 
+    self.scroll();
     try self.drawRows();
 
-    try self.writer.print("\x1b[{d};{d}H", .{ self.cy + 1, self.cx + 1 });
+    try self.writer.print("\x1b[{d};{d}H", .{
+        (self.cy - self.row_offset) + 1,
+        self.cx + 1,
+    });
 
     // Redraw the cursor, Set Mode
     try self.writer.print("\x1b[?25h", .{});
@@ -239,10 +252,12 @@ pub fn moveCursor(self: *Editor, key: Key) void {
             if (self.cy != 0) self.cy -= 1;
         },
         .arrow_down => {
-            if (self.screen_rows > 0 and self.cy + 1 < self.screen_rows) self.cy += 1;
+            if (self.cy + 1 < self.pt.totalLines()) self.cy += 1;
         },
         else => {},
     }
+    const line_len = self.pt.getLineLength(self.cy + 1);
+    if (self.cx > line_len) self.cx = line_len;
 }
 
 const Key = union(enum) {
