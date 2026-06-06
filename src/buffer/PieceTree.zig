@@ -6,7 +6,6 @@ buffers: std.ArrayList(Buffer) = .empty,
 root: *Node,
 sentinel: *Node,
 last_change_pos: u32 = 0,
-
 pub fn init(allocator: std.mem.Allocator) !PieceTree {
     // Instead of a ?*Node architexture we store a sentinel value
     // VSCode style to safely check nodes

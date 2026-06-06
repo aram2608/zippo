@@ -10,32 +10,47 @@ screen_rows: u16 = 0,
 screen_cols: u16 = 0,
 row_offset: u32 = 0,
 pt: PieceTree,
+// Maybe change these using a new Type pattern to represent document logic
+// that way they can be mutated independantly from drawing logic while being explicit
+// and type safe
 cy: u32 = 0,
 cx: u32 = 0,
+rx: u32 = 0,
+file_name: ?[]const u8 = null,
 writer: *Out,
+allocator: std.mem.Allocator,
 scratch: std.heap.ArenaAllocator,
 
 const VERSION = "0.1.0";
+const TAB_WIDTH: usize = 4;
 
 pub fn init(
     fd: std.posix.fd_t,
     writer: *Out,
     allocator: std.mem.Allocator,
 ) !Editor {
-    return .{
+    var editor: Editor = .{
         .fd = fd,
-        .pt = try PieceTree.init(allocator),
+        .pt = try .init(allocator),
         .writer = writer,
+        .allocator = allocator,
         .scratch = .init(allocator),
     };
+    try editor.getWindowSize();
+    editor.screen_rows -= 1;
+
+    return editor;
 }
 
 pub fn deinit(self: *Editor) void {
     self.pt.deinit();
     self.scratch.deinit();
+    if (self.file_name) |p|
+        self.allocator.free(p);
 }
 
 pub fn readFile(self: *Editor, io: std.Io, path: []const u8) !void {
+    self.file_name = try self.allocator.dupe(u8, path);
     try self.pt.loadFile(io, path);
 }
 
@@ -128,8 +143,19 @@ fn drawRows(self: *Editor) !void {
                 self.scratch.allocator(),
                 (row + 1),
             );
-            const len = @min(line.len, self.screen_cols);
-            try self.writer.print("{s}", .{line[0..len]});
+            var col: usize = 0;
+            for (line) |char| {
+                if (col >= self.screen_cols) break;
+                if (char == '\t') {
+                    const spaces_needed = TAB_WIDTH - (col % TAB_WIDTH);
+                    const spaces_to_print = @min(spaces_needed, self.screen_cols - col);
+                    try self.writer.splatByteAll(' ', spaces_to_print);
+                    col += spaces_to_print;
+                } else {
+                    try self.writer.writeByte(char);
+                    col += 1;
+                }
+            }
         } else if (total == 0 and y == self.screen_rows / 3) {
             var buf: [80]u8 = undefined;
             const msg = try std.fmt.bufPrint(
@@ -141,25 +167,76 @@ fn drawRows(self: *Editor) !void {
             var pad = self.centerLine(len);
 
             if (pad > 0) {
-                try self.writer.print("~", .{});
+                try self.writer.writeByte('~');
                 pad -= 1;
             }
 
-            while (pad > 0) : (pad -= 1) try self.writer.print(" ", .{});
+            while (pad > 0) : (pad -= 1) try self.writer.writeByte(' ');
             try self.writer.print("{s}", .{msg[0..len]});
         } else {
-            try self.writer.print("~", .{});
+            try self.writer.writeByte('~');
         }
 
         // Clear each line as we draw it, Erase in Line
-        try self.writer.print("\x1b[K", .{});
-        if (self.screen_rows > 0 and y + 1 < self.screen_rows)
-            try self.writer.print("\r\n", .{});
+        try self.writer.writeSlice("\x1b[K");
+        try self.writer.writeSlice("\r\n");
     }
     try self.writer.flush();
 }
 
-fn scroll(self: *Editor) void {
+fn drawStatus(self: *Editor) !void {
+    // Select graphic rendition
+    // 1 bold, 4 underscore, 5 blink, 7 inverted color
+    try self.writer.writeSlice("\x1b[7m");
+    const lines = self.pt.totalLines();
+
+    var buf: [80]u8 = undefined;
+    const file = try std.fmt.bufPrint(&buf, "{[str]s:.[width]} -- {[lines]d} lines", .{
+        .str = if (self.file_name) |n| n else "[No File]",
+        .width = if (self.file_name) |n| n.len else 20,
+        .lines = lines,
+    });
+    // try self.writer.print("{s}", .{file});
+    try self.writer.writeSlice(file);
+
+    var len: usize = file.len;
+
+    const l = try std.fmt.bufPrint(&buf, "{d}/{d}", .{ self.cy + 1, lines });
+
+    while (len < self.screen_cols) : (len += 1) {
+        if (self.screen_cols - len == l.len) {
+            try self.writer.writeSlice(l);
+            break;
+        } else {
+            try self.writer.writeByte(' ');
+        }
+    }
+    // Clear all arguments to go back to normal
+    try self.writer.writeSlice("\x1b[m");
+    try self.writer.flush();
+}
+
+fn cxToRx(cx: u32, line: []const u8) u32 {
+    var rx: u32 = 0;
+    var i: u32 = 0;
+    while (i < cx and i < line.len) : (i += 1) {
+        if (line[i] == '\t') {
+            rx += @intCast(TAB_WIDTH - (rx % TAB_WIDTH));
+        } else rx += 1;
+    }
+    return rx;
+}
+
+fn scroll(self: *Editor) !void {
+    self.rx = 0;
+    if (self.cy < self.pt.totalLines()) {
+        const line = try self.pt.getLineContent(
+            self.scratch.allocator(),
+            (self.cy + 1),
+        );
+        self.rx = cxToRx(self.cx, line);
+    }
+
     if (self.cy < self.row_offset) {
         self.row_offset = self.cy;
     }
@@ -174,20 +251,22 @@ pub fn refresh(self: *Editor) !void {
     _ = self.scratch.reset(.retain_capacity);
 
     // Hide cursor during refresh, Reset Mode
-    try self.writer.print("\x1b[?25l", .{});
+    try self.writer.writeSlice("\x1b[?25l");
     // Set the cursor at the corner with the H command
-    try self.writer.print("\x1b[H", .{});
+    try self.writer.writeSlice("\x1b[H");
 
-    self.scroll();
+    try self.scroll();
     try self.drawRows();
+    try self.drawStatus();
 
+    // Place cursor at end of line
     try self.writer.print("\x1b[{d};{d}H", .{
         (self.cy - self.row_offset) + 1,
-        self.cx + 1,
+        self.rx + 1,
     });
 
     // Redraw the cursor, Set Mode
-    try self.writer.print("\x1b[?25h", .{});
+    try self.writer.writeSlice("\x1b[?25h");
 
     try self.writer.flush();
 }
@@ -197,8 +276,8 @@ pub fn getCursorPos(self: *Editor) !void {
     var i: u16 = 0;
 
     // Cursor position report
-    try self.writer.print("\x1b[6n", .{});
-    try self.writer.print("\r\n", .{});
+    try self.writer.writeSlice("\x1b[6n");
+    try self.writer.writeSlice("\r\n");
     try self.writer.flush();
 
     while (i < buf.len - 1) : (i += 1) {
@@ -213,7 +292,8 @@ pub fn getCursorPos(self: *Editor) !void {
     // Zig does not have a sccanf so we need to extract the payload then calc
     // the location to the `;`.
     const payload = buf[2..i];
-    const semi = std.mem.indexOfScalar(u8, payload, ';') orelse return error.BadEscape;
+    const semi = std.mem.findScalar(u8, payload, ';') orelse return error.BadEscape;
+
     // We can then parse an int from the index of the `;` in decimal.
     self.screen_rows = try std.fmt.parseInt(u16, payload[0..semi], 10);
     self.screen_cols = try std.fmt.parseInt(u16, payload[semi + 1 ..], 10);
@@ -231,13 +311,37 @@ pub fn getWindowSize(self: *Editor) !void {
         // B command is Cursor down
         // There is no easy way to get the cursor position so we use this hack
         // to roughly calc it if the .ioctl call fails
-        try self.writer.print("\x1b[999C\x1b[999B", .{});
+        try self.writer.writeSlice("\x1b[999C\x1b[999B");
         try self.writer.flush();
         try self.getCursorPos();
     } else {
         self.screen_cols = ws.col;
         self.screen_rows = ws.row;
     }
+}
+
+pub fn pageUp(self: *Editor) void {
+    self.cy = self.row_offset; // top of view port
+    var n = self.screen_rows;
+    while (n > 0 and self.cy > 0) : (n -= 1) self.cy -= 1;
+}
+
+pub fn pageDown(self: *Editor) void {
+    const total = self.pt.totalLines();
+    // Guard against underflows
+    if (total == 0 or self.screen_rows == 0) return;
+    self.cy = self.row_offset + self.screen_rows - 1; // bottom of viewport
+    if (self.cy >= total) self.cy = total - 1;
+    var n = self.screen_rows;
+    while (n > 0 and self.cy + 1 < total) : (n -= 1) self.cy += 1;
+}
+
+pub fn home(self: *Editor) void {
+    self.cx = 0;
+}
+
+pub fn end(self: *Editor) void {
+    self.cx = self.screen_cols - 1;
 }
 
 pub fn moveCursor(self: *Editor, key: Key) void {
