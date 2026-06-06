@@ -12,14 +12,16 @@ fn controlKey(comptime c: u8) u8 {
 pub fn main(init: std.process.Init) !void {
     // This is appropriate for anything that lives as long as the process.
     const arena: std.mem.Allocator = init.arena.allocator();
-
-    const args = try init.minimal.args.toSlice(arena);
-    for (args) |arg| {
-        std.log.info("arg: {s}", .{arg});
-    }
-
     // In order to do I/O operations need an `Io` instance.
     const io = init.io;
+
+    const args = try init.minimal.args.toSlice(arena);
+
+    if (args.len < 2) {
+        std.debug.print("Usage: {s} <filename>\n", .{args[0]});
+        return error.NoFileProvided;
+    }
+
     var buf: [1024]u8 = undefined;
     var out = zippo.Out.init(io, &buf);
     errdefer {
@@ -38,6 +40,8 @@ pub fn main(init: std.process.Init) !void {
 
     var e = try zippo.Editor.init(raw.fd, &out, gpa);
     defer e.deinit();
+
+    try e.readFile(io, args[1]);
 
     try e.getWindowSize();
 

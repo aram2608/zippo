@@ -35,6 +35,10 @@ pub fn deinit(self: *Editor) void {
     self.scratch.deinit();
 }
 
+pub fn readFile(self: *Editor, io: std.Io, path: []const u8) !void {
+    try self.pt.loadFile(io, path);
+}
+
 // Bitwise & the char with 00011111
 // This sets the upper 3 bits of the character to 0
 // Mirroring what the control key does to characters

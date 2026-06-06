@@ -16,7 +16,7 @@ pub fn init(allocator: std.mem.Allocator) !PieceTree {
         .left = sentinel,
         .right = sentinel,
         .color = .black,
-        .piece = .{ .idx = .change, .start = 0, .len = 0, .line_feeds = 0 },
+        .piece = .sentinel,
         .size_left = 0,
         .lf_left = 0,
     };
@@ -36,6 +36,60 @@ pub fn deinit(self: *PieceTree) void {
     self.allocator.destroy(self.sentinel);
     for (self.buffers.items) |*b| b.deinit(self.allocator);
     self.buffers.deinit(self.allocator);
+}
+
+const CHUNK: usize = 64 * 1024;
+
+pub fn loadFile(self: *PieceTree, io: std.Io, path: []const u8) !void {
+    if (std.Io.Dir.cwd().openFile(io, path, .{})) |file| {
+        defer file.close(io);
+
+        var tmp: [CHUNK]u8 = undefined;
+
+        var buf: Buffer = .{};
+        errdefer buf.deinit(self.allocator);
+
+        var reader = file.reader(io, &tmp);
+        var lf: u32 = 0;
+
+        try buf.line_starts.append(self.allocator, 0);
+        var rif = &reader.interface;
+        while (rif.takeDelimiterInclusive('\n')) |line| {
+            try buf.bytes.appendSlice(self.allocator, line);
+            lf += 1;
+            // Byte offset of the next line's first byte.
+            try buf.line_starts.append(
+                self.allocator,
+                @intCast(buf.bytes.items.len),
+            );
+        } else |err| switch (err) {
+            error.EndOfStream => {
+                // If the file does not have a new line at the end
+                // we need to catch it
+                const tail = try rif.take(rif.end - rif.seek);
+                if (tail.len > 0) {
+                    try buf.bytes.appendSlice(self.allocator, tail);
+                }
+            },
+            error.ReadFailed => return reader.err.?,
+            error.StreamTooLong => return err,
+        }
+
+        const idx: BufferIndex = @enumFromInt(self.buffers.items.len);
+        try self.buffers.append(self.allocator, buf);
+
+        _ = try self.insertLeft(null, .{
+            .idx = idx,
+            .start = 0,
+            .len = @intCast(buf.bytes.items.len),
+            .line_feeds = lf,
+        });
+    } else |err| switch (err) {
+        error.FileNotFound, error.AccessDenied => {
+            std.debug.print("unable to open file: {}\n", .{err});
+        },
+        else => |e| return e,
+    }
 }
 
 fn freeSubtree(self: *PieceTree, node: *Node) void {
@@ -809,6 +863,13 @@ pub const Piece = struct {
     start: u32,
     len: u32,
     line_feeds: u32,
+
+    pub const sentinel: Piece = .{
+        .idx = .change,
+        .start = 0,
+        .len = 0,
+        .line_feeds = 0,
+    };
 };
 
 const Buffer = struct {
