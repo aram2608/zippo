@@ -17,7 +17,11 @@ cy: u32 = 0,
 cx: u32 = 0,
 rx: u32 = 0,
 file_name: ?[]const u8 = null,
+msg: ?[]const u8 = null,
+msg_time: std.Io.Timestamp,
+io: std.Io,
 writer: *Out,
+buf_state: BufferState = .clean,
 allocator: std.mem.Allocator,
 scratch: std.heap.ArenaAllocator,
 
@@ -28,6 +32,7 @@ pub fn init(
     fd: std.posix.fd_t,
     writer: *Out,
     allocator: std.mem.Allocator,
+    io: std.Io,
 ) !Editor {
     var editor: Editor = .{
         .fd = fd,
@@ -35,9 +40,12 @@ pub fn init(
         .writer = writer,
         .allocator = allocator,
         .scratch = .init(allocator),
+        .msg_time = std.Io.Clock.real.now(io),
+        .io = io,
     };
     try editor.getWindowSize();
-    editor.screen_rows -= 1;
+    editor.screen_rows -= 2;
+    try editor.setStatusMsg("HELP: Ctrl-Q = quit", .{});
 
     return editor;
 }
@@ -47,6 +55,8 @@ pub fn deinit(self: *Editor) void {
     self.scratch.deinit();
     if (self.file_name) |p|
         self.allocator.free(p);
+    if (self.msg) |m|
+        self.allocator.free(m);
 }
 
 pub fn readFile(self: *Editor, io: std.Io, path: []const u8) !void {
@@ -120,9 +130,8 @@ fn centerLine(self: *const Editor, len: u16) u16 {
 
 pub fn insertChar(self: *Editor, ch: u8) !void {
     // Clamp on EOF
-    const line_off = self.pt.offsetOfLine(self.cy + 1) orelse {
-        return;
-    };
+    const line_off = self.pt.offsetOfLine(self.cy + 1) orelse return;
+
     const off = line_off + self.cx;
     try self.pt.insert(off, &[_]u8{ch});
     if (ch == '\n') {
@@ -131,6 +140,7 @@ pub fn insertChar(self: *Editor, ch: u8) !void {
     } else {
         self.cx += 1;
     }
+    self.buf_state = .dirty;
 }
 
 fn drawRows(self: *Editor) !void {
@@ -184,6 +194,32 @@ fn drawRows(self: *Editor) !void {
     try self.writer.flush();
 }
 
+pub fn setStatusMsg(self: *Editor, comptime fmt: []const u8, args: anytype) !void {
+    var buf: [80]u8 = undefined;
+    const msg = try std.fmt.bufPrint(&buf, fmt, args);
+    self.msg = try self.allocator.dupe(u8, msg);
+    self.msg_time = std.Io.Clock.real.now(self.io);
+}
+
+fn drawMsg(self: *Editor) !void {
+    try self.writer.writeSlice("\x1b[K");
+
+    const msg = self.msg orelse return;
+
+    const elapsed = self.msg_time.untilNow(self.io, .real);
+
+    if (elapsed.toSeconds() >= 5) {
+        return;
+    }
+
+    var len = msg.len;
+    if (len > self.screen_cols) {
+        len = self.screen_cols;
+    }
+
+    try self.writer.writeSlice(msg[0..len]);
+}
+
 fn drawStatus(self: *Editor) !void {
     // Select graphic rendition
     // 1 bold, 4 underscore, 5 blink, 7 inverted color
@@ -191,11 +227,16 @@ fn drawStatus(self: *Editor) !void {
     const lines = self.pt.totalLines();
 
     var buf: [80]u8 = undefined;
-    const file = try std.fmt.bufPrint(&buf, "{[str]s:.[width]} -- {[lines]d} lines", .{
-        .str = if (self.file_name) |n| n else "[No File]",
-        .width = if (self.file_name) |n| n.len else 20,
-        .lines = lines,
-    });
+    const file = try std.fmt.bufPrint(
+        &buf,
+        "{[str]s:.[width]} -- {[lines]d} lines {[mod]s}",
+        .{
+            .str = if (self.file_name) |n| n else "[No File]",
+            .width = if (self.file_name) |n| n.len else 20,
+            .lines = lines,
+            .mod = if (self.buf_state == .dirty) "(modified)" else "",
+        },
+    );
     // try self.writer.print("{s}", .{file});
     try self.writer.writeSlice(file);
 
@@ -213,6 +254,7 @@ fn drawStatus(self: *Editor) !void {
     }
     // Clear all arguments to go back to normal
     try self.writer.writeSlice("\x1b[m");
+    try self.writer.writeSlice("\r\n");
     try self.writer.flush();
 }
 
@@ -258,6 +300,7 @@ pub fn refresh(self: *Editor) !void {
     try self.scroll();
     try self.drawRows();
     try self.drawStatus();
+    try self.drawMsg();
 
     // Place cursor at end of line
     try self.writer.print("\x1b[{d};{d}H", .{
@@ -269,6 +312,46 @@ pub fn refresh(self: *Editor) !void {
     try self.writer.writeSlice("\x1b[?25h");
 
     try self.writer.flush();
+}
+
+pub fn saveFile(self: *Editor) !void {
+    // TODO: Prompt the user for a save file name for now itll be a no op
+    if (self.file_name) |n| {
+        const cwd = std.Io.Dir.cwd();
+
+        const dir = std.Io.Dir.path.dirname(n);
+        const base = std.Io.Dir.path.basename(n);
+
+        const p = if (dir) |d|
+            try std.fmt.allocPrint(self.allocator, "{s}/.tmp.{s}", .{ d, base })
+        else
+            try std.fmt.allocPrint(self.allocator, ".tmp.{s}", .{base});
+        defer self.allocator.free(p);
+
+        var f = try cwd.createFile(self.io, p, .{});
+        errdefer cwd.deleteFile(self.io, p) catch {};
+        defer f.close(self.io);
+
+        const bytes = try self.pt.collectDoc(self.allocator);
+        defer self.allocator.free(bytes);
+
+        // Preallocate a page for the buffered writer
+        var file_buffer: [4096]u8 = undefined;
+        var writer = f.writer(self.io, &file_buffer);
+
+        try writer.interface.writeAll(bytes);
+        try writer.interface.flush();
+
+        // Rudimentary guard, a better solution probably exists though
+        const s = try f.stat(self.io);
+        if (s.size != bytes.len) {
+            try self.setStatusMsg("Failed to save file", .{});
+        } else {
+            try cwd.rename(p, std.Io.Dir.cwd(), n, self.io);
+            try self.setStatusMsg("File saved: {} bytes written to disk", .{s.size});
+        }
+        self.buf_state = .clean;
+    }
 }
 
 pub fn getCursorPos(self: *Editor) !void {
@@ -363,6 +446,8 @@ pub fn moveCursor(self: *Editor, key: Key) void {
     const line_len = self.pt.getLineLength(self.cy + 1);
     if (self.cx > line_len) self.cx = line_len;
 }
+
+const BufferState = enum(u1) { clean, dirty };
 
 const Key = union(enum) {
     char: u8,

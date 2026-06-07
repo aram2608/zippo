@@ -1091,8 +1091,9 @@ fn dumpTree(p: *PieceTree, n: *Node, depth: u32) void {
     dumpTree(p, n.right, depth + 1);
 }
 
-// Walks the tree in document order and returns the full doc bytes.
-fn collectDoc(p: *PieceTree, allocator: std.mem.Allocator) ![]u8 {
+/// Walks the tree in document order and returns the full doc bytes.
+/// Caller owns the memory
+pub fn collectDoc(p: *PieceTree, allocator: std.mem.Allocator) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
     if (p.root == p.sentinel) return out.toOwnedSlice(allocator);

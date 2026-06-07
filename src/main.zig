@@ -33,7 +33,7 @@ pub fn main(init: std.process.Init) !void {
     // Long-lived allocator for the piece tree; supports real free as edits delete nodes.
     const gpa = std.heap.smp_allocator;
 
-    var e = try zippo.Editor.init(raw.fd, &out, gpa);
+    var e = try zippo.Editor.init(raw.fd, &out, gpa, io);
     defer e.deinit();
 
     if (args.len >= 2) {
@@ -48,11 +48,19 @@ pub fn main(init: std.process.Init) !void {
         switch (c) {
             .char => |ch| switch (ch) {
                 controlKey('q') => {
-                    try out.print("\x1b[2J", .{});
-                    try out.print("\x1b[H", .{});
-                    try out.flush();
-                    break;
+                    switch (e.buf_state) {
+                        .clean => {
+                            try out.print("\x1b[2J", .{});
+                            try out.print("\x1b[H", .{});
+                            try out.flush();
+                            break;
+                        },
+                        .dirty => {
+                            try e.setStatusMsg("Changes not saved", .{});
+                        },
+                    }
                 },
+                controlKey('s') => try e.saveFile(),
                 '\r' => try e.insertChar('\n'),
                 else => try e.insertChar(ch),
             },
