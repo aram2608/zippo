@@ -453,6 +453,9 @@ fn deleteNode(self: *PieceTree, z: *Node) void {
             x.parent = y.parent;
         }
 
+        // Fix metadata along x's hierarchy first, before y is moved into z's slot.
+        self.recomputeMetaData(x);
+
         y.left = z.left;
         y.right = z.right;
         y.parent = z.parent;
@@ -477,12 +480,27 @@ fn deleteNode(self: *PieceTree, z: *Node) void {
         }
         y.size_left = z.size_left;
         y.lf_left = z.lf_left;
-        self.recomputeMetaData(x);
+        // Propagate y's metadata along its NEW hierarchy (above z's old slot).
+        self.recomputeMetaData(y);
     }
 
     self.detach(z);
 
-    self.recomputeMetaData(x.parent);
+    // Backstop for the recomputeMetaData walk's sentinel ambiguity: when x is the
+    // sentinel and lands at x.parent.left, the walk-up condition x == x.parent.right
+    // is also true (the shared sentinel is on both sides), so the walk overshoots
+    // x.parent and reads its stale size_left. Recompute that one node from scratch.
+    if (x.parent.left == x) {
+        const new_sl = self.calcSize(x);
+        const new_lfl = self.calcLF(x);
+        if (new_sl != x.parent.size_left or new_lfl != x.parent.lf_left) {
+            const delta: i64 = @as(i64, new_sl) - @as(i64, x.parent.size_left);
+            const lf_delta: i64 = @as(i64, new_lfl) - @as(i64, x.parent.lf_left);
+            x.parent.size_left = new_sl;
+            x.parent.lf_left = new_lfl;
+            self.updateMetadata(x.parent, delta, lf_delta);
+        }
+    }
 
     if (!y_was_red) self.fixDelete(x);
 }
@@ -776,7 +794,7 @@ pub fn getLineContent(
 
     while (node != self.sentinel) {
         const p = node.piece;
-        // It would probably be good to have another helper that can use an offset
+        // TODO: It would probably be good to have another helper that can use an offset
         // for the front part and back part of a slice.
         // this is really brittle and easy to forget
         const bytes = self.pieceBytes(p)[off..];
@@ -1059,6 +1077,18 @@ test "delete spanning two pieces trims tail of first and head of second" {
     defer std.testing.allocator.free(line);
     try std.testing.expectEqualSlices(u8, "YYdcXX", line);
     p.validate(p.root);
+}
+
+fn dumpTree(p: *PieceTree, n: *Node, depth: u32) void {
+    if (n == p.sentinel) return;
+    var i: u32 = 0;
+    while (i < depth) : (i += 1) std.debug.print("  ", .{});
+    std.debug.print(
+        "{s} '{c}' sl={} len={}\n",
+        .{ @tagName(n.color), p.pieceBytes(n.piece)[0], n.size_left, n.piece.len },
+    );
+    dumpTree(p, n.left, depth + 1);
+    dumpTree(p, n.right, depth + 1);
 }
 
 // Walks the tree in document order and returns the full doc bytes.
