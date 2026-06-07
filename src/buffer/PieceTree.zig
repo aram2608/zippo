@@ -597,8 +597,8 @@ fn insertNode(
 }
 
 fn fixInsert(self: *PieceTree, n: *Node) void {
-    while (n != self.root and n.parent.color == .red) {
-        var x = n;
+    var x = n;
+    while (x != self.root and x.parent.color == .red) {
         if (x.parent == x.parent.parent.left) {
             var y = x.parent.parent.right;
             switch (y.color) {
@@ -746,7 +746,8 @@ pub fn getLineLength(self: *PieceTree, line: u32) u32 {
     var len: u32 = 0;
     while (node != self.sentinel) {
         const p = node.piece;
-        const bytes = self.pieceBytes(p);
+        // See getLineContent for same problem
+        const bytes = self.pieceBytes(p)[off..];
         // Offset by 1 if there is a line feed
         if (std.mem.findScalar(u8, bytes, '\n')) |i| {
             len += @intCast(i);
@@ -775,7 +776,10 @@ pub fn getLineContent(
 
     while (node != self.sentinel) {
         const p = node.piece;
-        const bytes = self.pieceBytes(p);
+        // It would probably be good to have another helper that can use an offset
+        // for the front part and back part of a slice.
+        // this is really brittle and easy to forget
+        const bytes = self.pieceBytes(p)[off..];
         if (std.mem.indexOfScalar(u8, bytes, '\n')) |i| {
             try out.appendSlice(allocator, bytes[0..i]); // exclude the '\n'
             return out.toOwnedSlice(allocator);
@@ -986,6 +990,14 @@ test "hot-path append extends piece" {
     p.validate(p.root);
 }
 
+test "line content is correctly calculate" {
+    var p = try PieceTree.init(std.testing.allocator);
+    defer p.deinit();
+    try p.insert(0, "hello seaman!!!");
+    const n: u32 = 15;
+    try std.testing.expectEqual(n, p.getLineLength(1));
+}
+
 test "three sequential non-hot-path inserts trigger rotation" {
     var p = try PieceTree.init(std.testing.allocator);
     defer p.deinit();
@@ -1010,8 +1022,8 @@ test "get line content" {
     defer p.deinit();
     try p.insert(0, "hello\nworld");
     const world = try p.getLineContent(std.testing.allocator, 2);
+    defer std.testing.allocator.free(world);
     try std.testing.expectEqualSlices(u8, "world", world);
-    std.testing.allocator.free(world);
 }
 
 test "totalLines and offsetOfLine" {
@@ -1191,4 +1203,20 @@ test "stress: interleaved insert and delete against a model" {
         defer std.testing.allocator.free(out);
         try std.testing.expectEqualSlices(u8, model.items, out);
     }
+}
+
+test "repeated deletes for short insertions" {
+    var p = try PieceTree.init(std.testing.allocator);
+    defer p.deinit();
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        try p.insert(0, "h");
+        p.validateInvariants();
+    }
+    i = 0;
+    while (i < 12) : (i += 1) {
+        try p.delete(0, 1);
+        p.validateInvariants();
+    }
+    try std.testing.expectEqual(p.sentinel, p.root);
 }

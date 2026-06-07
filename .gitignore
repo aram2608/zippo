@@ -3,6 +3,6 @@ zig-out/
 *.o
 
 .direnv/
-result/
+result
 
 TODO.md
