@@ -1,11 +1,13 @@
 const std = @import("std");
 const PieceTree = @This();
+const CHUNK: usize = 64 * 1024;
 
 allocator: std.mem.Allocator,
 buffers: std.ArrayList(Buffer) = .empty,
 root: *Node,
 sentinel: *Node,
 last_change_pos: u32 = 0,
+
 pub fn init(allocator: std.mem.Allocator) !PieceTree {
     // Instead of a ?*Node architexture we store a sentinel value
     // VSCode style to safely check nodes
@@ -36,8 +38,6 @@ pub fn deinit(self: *PieceTree) void {
     for (self.buffers.items) |*b| b.deinit(self.allocator);
     self.buffers.deinit(self.allocator);
 }
-
-const CHUNK: usize = 64 * 1024;
 
 pub fn loadFile(self: *PieceTree, io: std.Io, path: []const u8) !void {
     if (std.Io.Dir.cwd().openFile(io, path, .{})) |file| {
@@ -100,7 +100,7 @@ fn freeSubtree(self: *PieceTree, node: *Node) void {
 
 /// Resolve the bytes in a buffer given a specific index
 fn bufferBytes(self: *const PieceTree, idx: BufferIndex) []const u8 {
-    return self.buffers.items[@intFromEnum(idx)].bytes.items;
+    return self.buffers.items[idx.toUsize()].bytes.items;
 }
 
 /// A simple helper to calculate the line feeds in a slice of bytes
@@ -153,6 +153,7 @@ fn rightRotate(self: *PieceTree, y: *Node) void {
     y.parent = x;
 }
 
+/// Returns a node's logical position.
 pub fn nodeAt(self: *PieceTree, offset_in: u32) ?Position {
     var x = self.root;
     var offset = offset_in;
@@ -176,8 +177,9 @@ pub fn nodeAt(self: *PieceTree, offset_in: u32) ?Position {
     return null;
 }
 
+/// Appends text into the change buffer, return's the Piece.
 fn appendToChangeBuffer(self: *PieceTree, text: []const u8) !Piece {
-    const buf = &self.buffers.items[0];
+    const buf = &self.buffers.items[BufferIndex.change.toUsize()];
     const start: u32 = @intCast(buf.bytes.items.len);
 
     try buf.bytes.appendSlice(self.allocator, text);
@@ -216,6 +218,7 @@ fn classify(self: *const PieceTree, p: Position, o: u32) InsertInst {
     return .end_node;
 }
 
+/// Inserts node's into the piece tree. Follows VSCode's logic.
 pub fn insert(self: *PieceTree, offset: u32, text: []const u8) !void {
     // Graft brand new nodes
     if (self.root == self.sentinel) {
@@ -254,7 +257,11 @@ pub fn insert(self: *PieceTree, offset: u32, text: []const u8) !void {
                 .idx = old.idx,
                 .start = split_at,
                 .len = old.len - pos.remainder,
-                .line_feeds = countLF(self.bufferBytes(old.idx), split_at, old.start + old.len),
+                .line_feeds = countLF(
+                    self.bufferBytes(old.idx),
+                    split_at,
+                    (old.start + old.len),
+                ),
             };
 
             // The existing node needs to shrink down
@@ -309,7 +316,7 @@ fn deleteNodeTail(self: *PieceTree, node: *Node, remainder: u32) void {
     );
 }
 
-/// Split `node` into [0..start) and [end..len), drop the middle.
+/// Split `node` into [0..start] and [end..len], drop the middle.
 fn shrinkNode(self: *PieceTree, node: *Node, start: u32, end: u32) !void {
     const old = node.piece;
     const right_start = old.start + end;
@@ -329,10 +336,9 @@ fn shrinkNode(self: *PieceTree, node: *Node, start: u32, end: u32) !void {
     }, .right);
 }
 
+/// Recompute's a node's meta data after a change is made to the tree.
 fn recomputeMetaData(self: *PieceTree, n: *Node) void {
     var x = n;
-    var delta: u32 = 0;
-    var lf_delta: u32 = 0;
 
     if (x == self.root) return;
 
@@ -346,34 +352,24 @@ fn recomputeMetaData(self: *PieceTree, n: *Node) void {
 
     const new_sl = self.calcSize(x.left);
     const new_lfl = self.calcLF(x.left);
-    delta = new_sl - x.size_left;
-    lf_delta = new_lfl - x.lf_left;
+
+    const delta: i64 = @as(i64, new_sl) - @as(i64, x.size_left);
+    const lf_delta: i64 = @as(i64, new_lfl) - @as(i64, x.lf_left);
 
     x.size_left = new_sl;
     x.lf_left = new_lfl;
 
     while (x != self.root) {
         if (x.parent.left == x) {
-            x.parent.size_left += delta;
-            x.parent.lf_left += lf_delta;
+            x.parent.size_left = @intCast(@as(i64, x.parent.size_left) + delta);
+            x.parent.lf_left = @intCast(@as(i64, x.parent.lf_left) + lf_delta);
         }
-
         x = x.parent;
     }
 }
 
-/// Simple helper to calculate the number of line feeds (LR '\n') for a node
-fn calcLF(self: *const PieceTree, n: *Node) u32 {
-    if (n == self.sentinel) return 0;
-    return n.lf_left + n.piece.line_feeds + self.calcLF(n.right);
-}
-
-/// Simple helper to calculate the size of a node's bytes
-fn calcSize(self: *const PieceTree, n: *Node) u32 {
-    if (n == self.sentinel) return 0;
-    return n.size_left + n.piece.len + self.calcSize(n.right);
-}
-
+/// Delete's text from the buffer. The offset is the index into the buffer and
+/// the count is the length of the text to be deleted.
 pub fn delete(self: *PieceTree, offset: u32, count: u32) !void {
     if (count == 0 or self.root == self.sentinel) return;
 
@@ -403,14 +399,14 @@ pub fn delete(self: *PieceTree, offset: u32, count: u32) !void {
     }
 
     self.deleteNodeTail(start_node, start_pos.remainder);
-    var n = self.successor(start_node);
+    var n = self.next(start_node);
     if (start_node.piece.len == 0) self.deleteNode(start_node);
 
     self.deleteNodeHead(end_node, end_pos.remainder);
     if (end_node.piece.len == 0) self.deleteNode(end_node);
 
     while (n != self.sentinel and n != end_node) {
-        const after = self.successor(n);
+        const after = self.next(n);
         self.deleteNode(n);
         n = after;
     }
@@ -479,8 +475,8 @@ fn deleteNode(self: *PieceTree, z: *Node) void {
         if (y.right != self.sentinel) {
             y.right.parent = y;
         }
-        y.size_left = x.size_left;
-        y.lf_left = x.lf_left;
+        y.size_left = z.size_left;
+        y.lf_left = z.lf_left;
         self.recomputeMetaData(x);
     }
 
@@ -492,20 +488,16 @@ fn deleteNode(self: *PieceTree, z: *Node) void {
 }
 
 fn fixDelete(self: *PieceTree, n: *Node) void {
-    while (n != self.root and n.color == .black) {
-        var x = n;
-        var w = x;
-
+    var x = n;
+    while (x != self.root and x.color == .black) {
         if (x == x.parent.left) {
-            w = x.parent.right;
-
+            var w = x.parent.right;
             if (w.color == .red) {
                 w.color = .black;
                 x.parent.color = .red;
                 self.leftRotate(x.parent);
-                w = x.parent.left;
+                w = x.parent.right;
             }
-
             if (w.left.color == .black and w.right.color == .black) {
                 w.color = .red;
                 x = x.parent;
@@ -513,26 +505,23 @@ fn fixDelete(self: *PieceTree, n: *Node) void {
                 if (w.right.color == .black) {
                     w.left.color = .black;
                     w.color = .red;
-                    self.rightRotate(x.parent);
-                    x = self.root;
+                    self.rightRotate(w);
+                    w = x.parent.right;
                 }
-
                 w.color = x.parent.color;
                 x.parent.color = .black;
-                x.right.color = .black;
+                w.right.color = .black;
                 self.leftRotate(x.parent);
                 x = self.root;
             }
         } else {
-            w = x.parent.left;
-
+            var w = x.parent.left;
             if (w.color == .red) {
                 w.color = .black;
                 x.parent.color = .red;
                 self.rightRotate(x.parent);
                 w = x.parent.left;
             }
-
             if (w.left.color == .black and w.right.color == .black) {
                 w.color = .red;
                 x = x.parent;
@@ -543,7 +532,6 @@ fn fixDelete(self: *PieceTree, n: *Node) void {
                     self.leftRotate(w);
                     w = x.parent.left;
                 }
-
                 w.color = x.parent.color;
                 x.parent.color = .black;
                 w.left.color = .black;
@@ -552,6 +540,7 @@ fn fixDelete(self: *PieceTree, n: *Node) void {
             }
         }
     }
+    x.color = .black;
 }
 
 const NodeInsert = enum(u1) { left, right };
@@ -662,7 +651,7 @@ fn detach(self: *PieceTree, n: *Node) void {
     self.allocator.destroy(n);
 }
 
-fn successor(self: *const PieceTree, n: *Node) *Node {
+fn next(self: *const PieceTree, n: *Node) *Node {
     if (n.right != self.sentinel) return self.leftmost(n.right);
     var x = n;
     while (x.parent != self.sentinel and x == x.parent.right) x = x.parent;
@@ -685,6 +674,24 @@ fn leftmost(self: *const PieceTree, start: *Node) *Node {
     return n;
 }
 
+fn lfCountInBuffer(
+    self: *const PieceTree,
+    idx: BufferIndex,
+    lo: u32,
+    hi: u32,
+) u32 {
+    const ls = self.buffers.items[idx.toUsize()].line_starts.items;
+    const a = std.sort.upperBound(u32, ls, lo, cmpU32);
+    const b = std.sort.upperBound(u32, ls, hi, cmpU32);
+    std.debug.assert(b > a);
+    return @intCast(b - a);
+}
+
+/// Returns the bytes from a piece
+fn pieceBytes(self: *const PieceTree, p: Piece) []const u8 {
+    return self.bufferBytes(p.idx)[p.start..p.endOffset()];
+}
+
 /// Walk the tree upwards and propogate metadata
 /// (ie. line feed count changes or node length changes)
 /// The math here is a bit dangerous since delta's can be negative
@@ -704,9 +711,7 @@ fn updateMetadata(
     }
 }
 
-const LineLoc = struct { node: *Node, offset_in_piece: u32 };
-
-// Mirror of nodeAt, used for line locations
+/// Mirror of nodeAt, used for line locations
 fn lineStart(self: *PieceTree, line: u32) ?LineLoc {
     if (line == 1) {
         // first byte of the leftmost piece
@@ -732,6 +737,7 @@ fn lineStart(self: *PieceTree, line: u32) ?LineLoc {
     return null; // line past EOF
 }
 
+/// Another mirror of the `get*` family of helpers, returns a line's length
 pub fn getLineLength(self: *PieceTree, line: u32) u32 {
     const loc = self.lineStart(line) orelse return 0;
     var node = loc.node;
@@ -740,18 +746,21 @@ pub fn getLineLength(self: *PieceTree, line: u32) u32 {
     var len: u32 = 0;
     while (node != self.sentinel) {
         const p = node.piece;
-        const bytes = self.bufferBytes(p.idx)[p.start + off .. p.start + p.len];
+        const bytes = self.pieceBytes(p);
+        // Offset by 1 if there is a line feed
         if (std.mem.findScalar(u8, bytes, '\n')) |i| {
             len += @intCast(i);
             return len;
         }
         len += @intCast(bytes.len);
-        node = self.successor(node);
+        node = self.next(node);
         off = 0;
     }
     return len;
 }
 
+/// Return's a line's bytes. Walks the tree and appends into scratch buffer.
+/// Caller owns the slice.
 pub fn getLineContent(
     self: *PieceTree,
     allocator: std.mem.Allocator,
@@ -766,13 +775,13 @@ pub fn getLineContent(
 
     while (node != self.sentinel) {
         const p = node.piece;
-        const bytes = self.bufferBytes(p.idx)[p.start + off .. p.start + p.len];
+        const bytes = self.pieceBytes(p);
         if (std.mem.indexOfScalar(u8, bytes, '\n')) |i| {
             try out.appendSlice(allocator, bytes[0..i]); // exclude the '\n'
             return out.toOwnedSlice(allocator);
         }
         try out.appendSlice(allocator, bytes);
-        node = self.successor(node);
+        node = self.next(node);
         off = 0;
     }
     return out.toOwnedSlice(allocator);
@@ -821,6 +830,18 @@ fn offsetAfterNthLF(self: *PieceTree, p: Piece, k: u32) u32 {
     return abs - p.start;
 }
 
+/// Simple helper to calculate the number of line feeds (LR '\n') for a node
+fn calcLF(self: *const PieceTree, n: *Node) u32 {
+    if (n == self.sentinel) return 0;
+    return n.lf_left + n.piece.line_feeds + self.calcLF(n.right);
+}
+
+/// Simple helper to calculate the size of a node's bytes
+fn calcSize(self: *const PieceTree, n: *Node) u32 {
+    if (n == self.sentinel) return 0;
+    return n.size_left + n.piece.len + self.calcSize(n.right);
+}
+
 /// Calculates the number of lines from the total line feeds (LR)
 pub fn totalLines(self: *const PieceTree) u32 {
     if (self.root == self.sentinel) return 0;
@@ -849,11 +870,41 @@ pub fn validate(self: *PieceTree, node: *Node) void {
     self.validate(node.right);
 }
 
+/// Returns the black-height of the subtree rooted at `node`. Asserts the
+/// red-black invariants: red nodes have black children, every root-to-leaf
+/// path passes through the same number of black nodes.
+fn validateRB(self: *PieceTree, node: *Node) u32 {
+    if (node == self.sentinel) return 1;
+    if (node.color == .red) {
+        std.debug.assert(node.left.color == .black);
+        std.debug.assert(node.right.color == .black);
+    }
+    const lh = self.validateRB(node.left);
+    const rh = self.validateRB(node.right);
+    std.debug.assert(lh == rh);
+    return lh + @intFromBool(node.color == .black);
+}
+
+/// Full invariant check: sentinel color, root color, augmentation, RB shape.
+pub fn validateInvariants(self: *PieceTree) void {
+    std.debug.assert(self.sentinel.color == .black);
+    if (self.root == self.sentinel) return;
+    std.debug.assert(self.root.color == .black);
+    self.validate(self.root);
+    _ = self.validateRB(self.root);
+}
+
 /// Result of locating a byte offset within the tree.
 const Position = struct {
     node: *Node,
     remainder: u32, // byte offset of the target within node.piece
     node_start_offset: u32, // absolute byte offset where node.piece begins
+};
+
+/// Result of locating a line location in the tree
+const LineLoc = struct {
+    node: *Node,
+    offset_in_piece: u32, // byte offset in the node.piece
 };
 
 pub const Node = struct {
@@ -877,10 +928,14 @@ const InsertInst = enum {
     end_node,
 };
 
-const BufferIndex = enum(u32) { change = 0, _ };
-pub const DocumentOffset = enum(u32) { zero = 0, _ };
-pub const BufferOffset = enum(u32) { _ };
-pub const PieceOffset = enum(u32) { _ };
+const BufferIndex = enum(u32) {
+    change = 0,
+    _,
+
+    pub fn toUsize(idx: BufferIndex) usize {
+        return @intFromEnum(idx);
+    }
+};
 
 pub const Piece = struct {
     idx: BufferIndex,
@@ -894,6 +949,10 @@ pub const Piece = struct {
         .len = 0,
         .line_feeds = 0,
     };
+
+    fn endOffset(p: Piece) u32 {
+        return p.start + p.len;
+    }
 };
 
 const Buffer = struct {
@@ -988,4 +1047,148 @@ test "delete spanning two pieces trims tail of first and head of second" {
     defer std.testing.allocator.free(line);
     try std.testing.expectEqualSlices(u8, "YYdcXX", line);
     p.validate(p.root);
+}
+
+// Walks the tree in document order and returns the full doc bytes.
+fn collectDoc(p: *PieceTree, allocator: std.mem.Allocator) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    if (p.root == p.sentinel) return out.toOwnedSlice(allocator);
+    var node = p.leftmost(p.root);
+    while (node != p.sentinel) {
+        const piece = node.piece;
+        const bytes = p.bufferBytes(piece.idx)[piece.start..piece.endOffset()];
+        try out.appendSlice(allocator, bytes);
+        node = p.next(node);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "deleteNode: delete the only piece leaves an empty tree" {
+    var p = try PieceTree.init(std.testing.allocator);
+    defer p.deinit();
+    try p.insert(0, "hello");
+    try p.delete(0, 5);
+    p.validateInvariants();
+    try std.testing.expectEqual(@as(u32, 0), p.subtreeBytes(p.root));
+    try std.testing.expectEqual(p.sentinel, p.root);
+}
+
+test "deleteNode: leaf removal preserves invariants" {
+    var p = try PieceTree.init(std.testing.allocator);
+    defer p.deinit();
+    // Three single-byte pieces in document order "abc".
+    try p.insert(0, "c");
+    try p.insert(0, "b");
+    try p.insert(0, "a");
+    p.validateInvariants();
+    // Drop the middle byte entirely. Goes through deleteNode for the middle piece.
+    try p.delete(1, 1);
+    p.validateInvariants();
+    const out = try collectDoc(&p, std.testing.allocator);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualSlices(u8, "ac", out);
+}
+
+test "deleteNode: two-children successor splice preserves invariants" {
+    var p = try PieceTree.init(std.testing.allocator);
+    defer p.deinit();
+    // Five distinct pieces. After RB rebalancing the middle is an internal node
+    // with two children, exercising the successor-splice branch in deleteNode.
+    var i: u8 = 0;
+    while (i < 5) : (i += 1) {
+        const ch: u8 = 'a' + i;
+        try p.insert(0, &[_]u8{ch});
+    }
+    p.validateInvariants();
+    // Document is "edcba"; drop the middle byte 'c'.
+    try p.delete(2, 1);
+    p.validateInvariants();
+    const out = try collectDoc(&p, std.testing.allocator);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualSlices(u8, "edba", out);
+}
+
+test "fixDelete: repeated black-leaf removals from the right" {
+    var p = try PieceTree.init(std.testing.allocator);
+    defer p.deinit();
+    // Build a multi-level tree of single-byte pieces. Document order ends up as
+    // the reverse of insertion order, which is fine for this test.
+    const count: u8 = 12;
+    var i: u8 = 0;
+    while (i < count) : (i += 1) {
+        const ch: u8 = 'a' + i;
+        try p.insert(0, &[_]u8{ch});
+        p.validateInvariants();
+    }
+    // Tear it down from the right. Most of these go through deleteNode and many
+    // through fixDelete (the deleted node is black often enough).
+    var remaining: u32 = count;
+    while (remaining > 0) : (remaining -= 1) {
+        try p.delete(remaining - 1, 1);
+        p.validateInvariants();
+    }
+    try std.testing.expectEqual(@as(u32, 0), p.subtreeBytes(p.root));
+}
+
+test "fixDelete: repeated black-leaf removals from the front" {
+    var p = try PieceTree.init(std.testing.allocator);
+    defer p.deinit();
+    const count: u8 = 12;
+    var i: u8 = 0;
+    while (i < count) : (i += 1) {
+        const ch: u8 = 'a' + i;
+        try p.insert(0, &[_]u8{ch});
+        p.validateInvariants();
+    }
+    var remaining: u32 = count;
+    while (remaining > 0) : (remaining -= 1) {
+        try p.delete(0, 1);
+        p.validateInvariants();
+    }
+    try std.testing.expectEqual(@as(u32, 0), p.subtreeBytes(p.root));
+}
+
+test "classify does not hot-path at a non-tail node boundary" {
+    var p = try PieceTree.init(std.testing.allocator);
+    defer p.deinit();
+    try p.insert(0, "abc"); // change buffer tail is at 3
+    try p.insert(3, "def"); // hot path, change buffer tail moves to 6
+    // Now insert at offset 0. node_start_offset+piece.len of the leftmost piece
+    // is 3, not 0, so this must not hot-path. It should land as a node_boundary.
+    try p.insert(0, "X");
+    p.validateInvariants();
+    const out = try collectDoc(&p, std.testing.allocator);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualSlices(u8, "Xabcdef", out);
+}
+
+test "stress: interleaved insert and delete against a model" {
+    var p = try PieceTree.init(std.testing.allocator);
+    defer p.deinit();
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const r = prng.random();
+    var model: std.ArrayList(u8) = .empty;
+    defer model.deinit(std.testing.allocator);
+
+    var ops: u32 = 0;
+    while (ops < 200) : (ops += 1) {
+        const len_now: u32 = @intCast(model.items.len);
+        const do_insert = len_now == 0 or r.intRangeAtMost(u8, 0, 1) == 0;
+        if (do_insert) {
+            const ch: u8 = 'a' + r.intRangeAtMost(u8, 0, 25);
+            const at = if (len_now == 0) 0 else r.intRangeAtMost(u32, 0, len_now);
+            try p.insert(at, &[_]u8{ch});
+            try model.insert(std.testing.allocator, at, ch);
+        } else {
+            const at = r.intRangeAtMost(u32, 0, len_now - 1);
+            try p.delete(at, 1);
+            _ = model.orderedRemove(at);
+        }
+        p.validateInvariants();
+
+        const out = try collectDoc(&p, std.testing.allocator);
+        defer std.testing.allocator.free(out);
+        try std.testing.expectEqualSlices(u8, model.items, out);
+    }
 }

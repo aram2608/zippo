@@ -36,6 +36,10 @@
 
         shellHook = ''
           echo "zippo dev shell: zig $(zig version)"
+          if [ -z "$IN_NIX_DEV" ] && [ -n "$SHELL" ]; then
+            export IN_NIX_DEV=1
+            exec $SHELL
+          fi
         '';
       };
     };
