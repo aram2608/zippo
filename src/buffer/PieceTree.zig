@@ -41,10 +41,9 @@ pub fn deinit(self: *PieceTree) void {
 
 fn appendNewLineIndices(
     text: []const u8,
-    off_set: usize,
-    line_starts: *std.ArrayList(u8),
+    line_starts: *std.ArrayList(u32),
     allocator: std.mem.Allocator,
-) !void {
+) !u32 {
     // Use SIMD instructions to try and optimize file reading for large files
     // We try and find the optimal length for the architexture otherwise default
     const V = std.simd.suggestVectorLength(u8) orelse 16;
@@ -55,82 +54,84 @@ fn appendNewLineIndices(
     // Creates a vector completly full of new line chars, this is use
     const splat: Chunk = @splat('\n');
 
+    var lf: u32 = 0;
     var i: usize = 0;
     // We iterate in V sized chunks of data
     while (i + V <= text.len) : (i += V) {
+        // Yank a V sized subslice of the text and load into the vector register
         const chunk: Chunk = text[i..][0..V].*;
+        // Compare all bytes in the chunk and splat simulaneously
+        // returns a V sized vector of booleans
+        // each 1 corresponds to a '\n'
         const eq_bits: @Vector(V, u1) = @bitCast(chunk == splat);
+        // The vector can then get cast into an unsigned int
         var mask: Mask = @bitCast(eq_bits);
 
-        // Bit scan forwards to find all the new lines
+        // Count all the 1's in the bit mask for '\n'
+        const hits = @popCount(mask);
+        lf += hits;
+
+        // Grow once per chunk so the inner loop is allocation-free.
+        try line_starts.ensureUnusedCapacity(allocator, hits);
+
+        // Bit scan forwards to find all the new lines using Brian Kernighan’s
+        // algorithm.
+        //
+        // After @bitCast, vector lane 0 ends up as the LSB of `mask`,
+        // so @ctz gives the index of the next match within the chunk.
+        // 0 0 0 0 0 1 0 1
+        // ^ MSB         ^ LSB (lane 0 of the vector)
         while (mask != 0) {
-            // Count Leading Zeros, bits are stored by signficance left -> right
-            // 0 0 0 0 0 1 0 1
-            //           ^ most significant bit
             const trailing_zeros = @ctz(mask);
+            // The buffer is flat so i + zeros gives us the offset to the '\n'
             const local_idx = i + trailing_zeros;
-            // The append an index after the '\n'
-            try line_starts.append(allocator, @intCast(off_set + local_idx + 1));
-            mask &= mask - 1; // Clear the lowest set bit
+            // The line start is always after the '\n'
+            line_starts.appendAssumeCapacity(@intCast(local_idx + 1));
+            // Clear the lowest set bit
+            // mask      = 10110000
+            // mask - 1  = 10101111
+            // AND       = 10100000
+            mask &= mask - 1;
         }
     }
+    // The file isn't guaranteed to be divisible by the chunk size
+    // so we need to eat up the trailing bytes
     while (i < text.len) : (i += 1) {
         if (text[i] == '\n') {
-            try line_starts.append(allocator, @intCast(off_set + i + 1));
+            lf += 1;
+            try line_starts.append(allocator, @intCast(i + 1));
         }
     }
+    return lf;
 }
 
 pub fn loadFile(self: *PieceTree, io: std.Io, path: []const u8) !void {
-    if (std.Io.Dir.cwd().openFile(io, path, .{})) |file| {
-        defer file.close(io);
+    var buf: Buffer = .{};
+    errdefer buf.deinit(self.allocator);
 
-        var tmp: [CHUNK]u8 = undefined;
+    // Start the document at a zero byte offset
+    try buf.line_starts.append(self.allocator, 0);
 
-        var buf: Buffer = .{};
-        errdefer buf.deinit(self.allocator);
+    var tmp: [CHUNK]u8 = undefined;
+    // For now let's assume every file will fit in the chunk
+    // If need be an allocating read can be used
+    const cwd = std.Io.Dir.cwd();
+    const contents = try cwd.readFile(io, path, &tmp);
 
-        var reader = file.reader(io, &tmp);
-        var lf: u32 = 0;
+    try buf.bytes.appendSlice(self.allocator, contents);
 
-        try buf.line_starts.append(self.allocator, 0);
-        var rif = &reader.interface;
-        while (rif.takeDelimiterInclusive('\n')) |line| {
-            try buf.bytes.appendSlice(self.allocator, line);
-            lf += 1;
-            // Byte offset of the next line's first byte.
-            try buf.line_starts.append(
-                self.allocator,
-                @intCast(buf.bytes.items.len),
-            );
-        } else |err| switch (err) {
-            error.EndOfStream => {
-                // If the file does not have a new line at the end
-                // we need to catch it
-                const tail = try rif.take(rif.end - rif.seek);
-                if (tail.len > 0) {
-                    try buf.bytes.appendSlice(self.allocator, tail);
-                }
-            },
-            error.ReadFailed => return reader.err.?,
-            error.StreamTooLong => return err,
-        }
+    const lf = try appendNewLineIndices(contents, &buf.line_starts, self.allocator);
 
-        const idx: BufferIndex = @enumFromInt(self.buffers.items.len);
-        try self.buffers.append(self.allocator, buf);
+    const idx: BufferIndex = @enumFromInt(self.buffers.items.len);
 
-        _ = try self.insertNode(null, .{
-            .idx = idx,
-            .start = 0,
-            .len = @intCast(buf.bytes.items.len),
-            .line_feeds = lf,
-        }, .left);
-    } else |err| switch (err) {
-        error.FileNotFound, error.AccessDenied => {
-            std.debug.print("unable to open file: {}\n", .{err});
-        },
-        else => |e| return e,
-    }
+    try self.buffers.append(self.allocator, buf);
+
+    _ = try self.insertNode(null, .{
+        .idx = idx,
+        .start = 0,
+        .len = @intCast(buf.bytes.items.len),
+        .line_feeds = lf,
+    }, .left);
 }
 
 fn freeSubtree(self: *PieceTree, node: *Node) void {
