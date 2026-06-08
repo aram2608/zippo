@@ -39,6 +39,48 @@ pub fn deinit(self: *PieceTree) void {
     self.buffers.deinit(self.allocator);
 }
 
+fn appendNewLineIndices(
+    text: []const u8,
+    off_set: usize,
+    line_starts: *std.ArrayList(u8),
+    allocator: std.mem.Allocator,
+) !void {
+    // Use SIMD instructions to try and optimize file reading for large files
+    // We try and find the optimal length for the architexture otherwise default
+    const V = std.simd.suggestVectorLength(u8) orelse 16;
+    // We need to define a vector type holding V number of bytes
+    const Chunk = @Vector(V, u8);
+    // This creates an unsigned integer with exactly V number of bits
+    const Mask = std.meta.Int(.unsigned, V);
+    // Creates a vector completly full of new line chars, this is use
+    const splat: Chunk = @splat('\n');
+
+    var i: usize = 0;
+    // We iterate in V sized chunks of data
+    while (i + V <= text.len) : (i += V) {
+        const chunk: Chunk = text[i..][0..V].*;
+        const eq_bits: @Vector(V, u1) = @bitCast(chunk == splat);
+        var mask: Mask = @bitCast(eq_bits);
+
+        // Bit scan forwards to find all the new lines
+        while (mask != 0) {
+            // Count Leading Zeros, bits are stored by signficance left -> right
+            // 0 0 0 0 0 1 0 1
+            //           ^ most significant bit
+            const trailing_zeros = @ctz(mask);
+            const local_idx = i + trailing_zeros;
+            // The append an index after the '\n'
+            try line_starts.append(allocator, @intCast(off_set + local_idx + 1));
+            mask &= mask - 1; // Clear the lowest set bit
+        }
+    }
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\n') {
+            try line_starts.append(allocator, @intCast(off_set + i + 1));
+        }
+    }
+}
+
 pub fn loadFile(self: *PieceTree, io: std.Io, path: []const u8) !void {
     if (std.Io.Dir.cwd().openFile(io, path, .{})) |file| {
         defer file.close(io);

@@ -71,56 +71,17 @@ fn controlKey(comptime c: u8) u8 {
     return c & 0x1f;
 }
 
-fn readByte(self: *const Editor) ?u8 {
-    var b: [1]u8 = undefined;
-    const n = std.posix.read(self.fd, &b) catch return null;
-    return if (n == 1) b[0] else null;
-}
-
 pub fn readKey(self: *const Editor) !Key {
-    var in: [1]u8 = undefined;
+    var p = Parser{};
     while (true) {
-        const n = std.posix.read(self.fd, &in) catch |err| switch (err) {
+        var in: [1]u8 = undefined;
+        const nread = std.posix.read(self.fd, &in) catch |err| switch (err) {
             error.WouldBlock => continue,
             else => return err,
         };
-        if (n == 1) break;
+        if (nread == 0) continue;
+        if (p.feed(in[0])) |key| return key;
     }
-
-    if (in[0] != '\x1b') return .{ .char = in[0] };
-
-    const b0 = self.readByte() orelse return .{ .char = '\x1b' };
-    const b1 = self.readByte() orelse return .{ .char = '\x1b' };
-
-    if (b0 == '[') {
-        if (b1 >= '0' and b1 <= '9') {
-            const b2 = self.readByte() orelse return .{ .char = '\x1b' };
-            if (b2 == '~') return switch (b1) {
-                '1' => .home,
-                '3' => .delete,
-                '4' => .end,
-                '5' => .page_up,
-                '6' => .page_down,
-                '7' => .home,
-                '8' => .end,
-                else => .{ .char = '\x1b' },
-            };
-        } else return switch (b1) {
-            'A' => .arrow_up,
-            'B' => .arrow_down,
-            'C' => .arrow_right,
-            'D' => .arrow_left,
-            'H' => .home,
-            'F' => .end,
-            else => .{ .char = '\x1b' },
-        };
-    } else if (b0 == 'O') return switch (b1) {
-        'H' => .home,
-        'F' => .end,
-        else => .{ .char = '\x1b' },
-    };
-
-    return .{ .char = '\x1b' };
 }
 
 fn centerLine(self: *const Editor, len: u16) u16 {
@@ -140,6 +101,60 @@ pub fn insertChar(self: *Editor, ch: u8) !void {
     } else {
         self.cx += 1;
     }
+    self.buf_state = .dirty;
+}
+
+pub fn insertString(self: *Editor, text: []const u8) !void {
+    const line_off = self.pt.offsetOfLine(self.cy + 1) orelse return;
+    const off = line_off + self.cx;
+    try self.pt.insert(off, text);
+
+    // Linear searches are fine for short sequences, assuming nobody
+    // is copy pasting hundres of lines of code this is probably fine
+    const nl_count = std.mem.countScalar(u8, text, '\n');
+    if (nl_count == 0) {
+        self.cx += @intCast(text.len);
+    } else {
+        const last = std.mem.findScalarLast(u8, text, '\n').?;
+        self.cy += @intCast(nl_count);
+        self.cx = @intCast(text.len - last - 1);
+    }
+
+    self.buf_state = .dirty;
+}
+
+pub fn backspace(self: *Editor) !void {
+    if (self.cy == 0 and self.cx == 0) return;
+
+    const line_off = self.pt.offsetOfLine(self.cy + 1) orelse return;
+
+    // If we are in a line
+    if (self.cx > 0) {
+        try self.pt.delete(line_off + self.cx - 1, 1);
+        self.cx -= 1;
+        // If a line is empty go back to the previous line
+    } else {
+        const prev_len = self.pt.getLineLength(self.cy);
+        try self.pt.delete(line_off - 1, 1);
+        self.cy -= 1;
+        self.cx = prev_len;
+    }
+    self.buf_state = .dirty;
+}
+
+pub fn delete(self: *Editor) !void {
+    const total = self.pt.totalLines();
+    if (total == 0) return;
+
+    const line_off = self.pt.offsetOfLine(self.cy + 1) orelse return;
+    const line_len = self.pt.getLineLength(self.cy + 1);
+
+    if (self.cx < line_len) {
+        try self.pt.delete(line_off + self.cx, 1);
+    } else if (self.cy + 1 < total) {
+        try self.pt.delete(line_off + line_len, 1);
+    } else return;
+
     self.buf_state = .dirty;
 }
 
@@ -460,4 +475,102 @@ const Key = union(enum) {
     home,
     end,
     delete,
+};
+
+const Parser = struct {
+    state: enum { ground, esc, csi, ss3 } = .ground,
+    params: [8]u16 = std.mem.zeroes([8]u16),
+    n: usize = 0,
+
+    /// Resets the parse to default state
+    fn reset(p: *Parser) void {
+        p.* = .{};
+    }
+
+    /// Return the param stored in the buffer. Bounds safe op.
+    fn param(p: *const Parser, i: usize) u16 {
+        return if (i < p.n) p.params[i] else 0;
+    }
+
+    /// Feeds tokens into the Parser
+    /// follows a simple state machine given the type of key press
+    fn feed(p: *Parser, b: u8) ?Key {
+        switch (p.state) {
+            .ground => {
+                if (b == '\x1b') {
+                    p.state = .esc;
+                    return null;
+                }
+                return .{ .char = b };
+            },
+            .esc => switch (b) {
+                '[' => {
+                    p.state = .csi;
+                    p.n = 1;
+                    return null;
+                },
+                'O' => {
+                    p.state = .ss3;
+                    return null;
+                },
+                else => {
+                    p.reset();
+                    return .{ .char = b };
+                }, // bare ESC / Alt-key
+            },
+            .csi => {
+                if (b >= '0' and b <= '9') {
+                    // Saturating arithmetic instead of standard ops
+                    // this simply translates to:
+                    //      value = value * 10 + digit
+                    // the saturating op clamps to maxInt(u16) so that a bad
+                    // input doesn't blow up into an overflow
+                    p.params[p.n - 1] = p.params[p.n - 1] *| 10 +| (b - '0');
+                    return null;
+                }
+                if (b == ';') {
+                    if (p.n < p.params.len) p.n += 1;
+                    return null;
+                }
+                defer p.reset();
+                return p.dispatchCsi(b);
+            },
+            .ss3 => {
+                defer p.reset();
+                return dispatchSs3(b);
+            },
+        }
+    }
+
+    /// Parse Control Sequence Introducer commands
+    /// fit the form \x1b[
+    fn dispatchCsi(p: *const Parser, final: u8) Key {
+        return switch (final) {
+            'A' => .arrow_up,
+            'B' => .arrow_down,
+            'C' => .arrow_right,
+            'D' => .arrow_left,
+            'H' => .home,
+            'F' => .end,
+            '~' => switch (p.param(0)) {
+                1, 7 => .home,
+                3 => .delete,
+                4, 8 => .end,
+                5 => .page_up,
+                6 => .page_down,
+                else => .{ .char = '\x1b' },
+            },
+            else => .{ .char = '\x1b' },
+        };
+    }
+
+    /// Parse Single Shift 3, in the form \x1b O.
+    /// Like CSI but simpler
+    fn dispatchSs3(final: u8) Key {
+        return switch (final) {
+            'H' => .home,
+            'F' => .end,
+            else => .{ .char = '\x1b' },
+        };
+    }
 };

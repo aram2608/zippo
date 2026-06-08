@@ -45,7 +45,7 @@ pub fn main(init: std.process.Init) !void {
 
         const c = try e.readKey();
 
-        switch (c) {
+        try switch (c) {
             .char => |ch| switch (ch) {
                 controlKey('q') => {
                     switch (e.buf_state) {
@@ -62,6 +62,9 @@ pub fn main(init: std.process.Init) !void {
                 },
                 controlKey('s') => try e.saveFile(),
                 '\r' => try e.insertChar('\n'),
+                127,
+                8,
+                => try e.backspace(),
                 else => try e.insertChar(ch),
             },
             .arrow_left,
@@ -73,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
             .page_down => e.pageDown(),
             .home => e.home(),
             .end => e.end(),
-            .delete => {},
-        }
+            .delete => e.delete(),
+        };
     }
 }
