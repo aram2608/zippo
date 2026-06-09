@@ -11,4 +11,5 @@ pub fn printAnotherMessage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
 
 test "All tests" {
     _ = @import("buffer/PieceTree.zig");
+    _ = @import("editor/Editor.zig");
 }

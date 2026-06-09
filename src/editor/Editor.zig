@@ -104,20 +104,69 @@ pub fn insertChar(self: *Editor, ch: u8) !void {
     self.buf_state = .dirty;
 }
 
+/// Returns the count of line feeds and the index of the last '\n'
+fn countLFWithLast(text: []const u8) struct { count: u32, last_idx: ?usize } {
+    const V = std.simd.suggestVectorLength(u8) orelse 16;
+
+    // Only fall through to the optimized SIMD if the length warrants it
+    if (text.len < V) {
+        var lf: u32 = 0;
+        var last: ?usize = null;
+        for (text, 0..) |char, idx| {
+            if (char == '\n') {
+                lf += 1;
+                last = idx;
+            }
+        }
+        return .{ .count = lf, .last_idx = last };
+    }
+
+    const Chunk = @Vector(V, u8);
+    const Mask = std.meta.Int(.unsigned, V);
+    const splat: Chunk = @splat('\n');
+
+    var last: ?usize = null;
+    var lf: u32 = 0;
+    var i: usize = 0;
+    while (i + V <= text.len) : (i += V) {
+        const chunk: Chunk = text[i..][0..V].*;
+        const eq_bits: @Vector(V, u1) = @bitCast(chunk == splat);
+        const mask: Mask = @bitCast(eq_bits);
+
+        if (mask != 0) {
+            lf += @popCount(mask);
+
+            // Find the last match in the vector layout
+            const last_match_in_chunk = @bitSizeOf(Mask) - 1 - @clz(mask);
+
+            last = i + last_match_in_chunk;
+        }
+    }
+
+    while (i < text.len) : (i += 1) {
+        if (text[i] == '\n') {
+            lf += 1;
+            last = i;
+        }
+    }
+
+    return .{
+        .count = lf,
+        .last_idx = last,
+    };
+}
+
 pub fn insertString(self: *Editor, text: []const u8) !void {
     const line_off = self.pt.offsetOfLine(self.cy + 1) orelse return;
     const off = line_off + self.cx;
     try self.pt.insert(off, text);
 
-    // Linear searches are fine for short sequences, assuming nobody
-    // is copy pasting hundres of lines of code this is probably fine
-    const nl_count = std.mem.countScalar(u8, text, '\n');
-    if (nl_count == 0) {
-        self.cx += @intCast(text.len);
+    const new_lines = countLFWithLast(text);
+    if (new_lines.last_idx) |idx| {
+        self.cy += @intCast(new_lines.count);
+        self.cx = @intCast(text.len - idx - 1);
     } else {
-        const last = std.mem.findScalarLast(u8, text, '\n').?;
-        self.cy += @intCast(nl_count);
-        self.cx = @intCast(text.len - last - 1);
+        self.cx += @intCast(text.len);
     }
 
     self.buf_state = .dirty;
@@ -574,3 +623,29 @@ const Parser = struct {
         };
     }
 };
+
+test "countLFWithLast - SIMD and scalar edge cases" {
+    const testing = std.testing;
+
+    const res1 = countLFWithLast("");
+    try testing.expectEqual(@as(u32, 0), res1.count);
+    try testing.expectEqual(@as(?usize, null), res1.last_idx);
+
+    const res2 = countLFWithLast("Hello World!");
+    try testing.expectEqual(@as(u32, 0), res2.count);
+    try testing.expectEqual(@as(?usize, null), res2.last_idx);
+
+    const res3 = countLFWithLast("Hello\n");
+    try testing.expectEqual(@as(u32, 1), res3.count);
+    try testing.expectEqual(@as(?usize, 5), res3.last_idx);
+
+    const res4 = countLFWithLast("Line1\nLine2\nLine3\nEnding");
+    try testing.expectEqual(@as(u32, 3), res4.count);
+    // 'g' is at 23, last '\n' is right before 'Ending' (length 6), so index 17
+    try testing.expectEqual(@as(?usize, 17), res4.last_idx);
+
+    const long_text = "a\n" ** 50; // 100 bytes long
+    const res5 = countLFWithLast(long_text);
+    try testing.expectEqual(@as(u32, 50), res5.count);
+    try testing.expectEqual(@as(?usize, 99), res5.last_idx);
+}

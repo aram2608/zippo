@@ -30,7 +30,8 @@ pub fn main(init: std.process.Init) !void {
     const raw = try zippo.RawMode.init(fd);
     defer raw.deinit();
 
-    // Long-lived allocator for the piece tree; supports real free as edits delete nodes.
+    // Long-lived allocator for the piece tree
+    // supports real free as edits delete nodes.
     const gpa = std.heap.smp_allocator;
 
     var e = try zippo.Editor.init(raw.fd, &out, gpa, io);
